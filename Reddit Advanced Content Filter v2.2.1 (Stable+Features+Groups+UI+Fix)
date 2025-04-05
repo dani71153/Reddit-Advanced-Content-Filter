@@ -1,0 +1,2334 @@
+// ==UserScript==
+// @name         Reddit Advanced Content Filter v2.2.1 (Stable+Features+Groups+UI+Fix)
+// @namespace    reddit-filter
+// @version      2.2.1
+// @description  Filters Reddit content by keywords, regex, user, subreddit with target & normalization options. Includes text replacement for comments and toggleable Filter Groups. Enhanced UI colors. UI panel is movable, resizable, remembers state. Fixes group rule adding.
+// @author       YourName (Modified by Assistant)
+// @match        https://www.reddit.com/*
+// @match        https://old.reddit.com/*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_registerMenuCommand
+// @grant        GM_log
+// @require      https://cdn.jsdelivr.net/npm/dompurify@2.4.4/dist/purify.min.js
+// @license      MIT
+// @downloadURL  https://update.greasyfork.org/scripts/YOUR_SCRIPT_ID/Reddit%20Advanced%20Content%20Filter%20v221%20%28Stable%2BFeatures%2BGroups%2BUI%2BFix%29.user.js
+// @updateURL    https://update.greasyfork.org/scripts/YOUR_SCRIPT_ID/Reddit%20Advanced%20Content%20Filter%20v221%20%28Stable%2BFeatures%2BGroups%2BUI%2BFix%29.meta.js
+// ==/UserScript==
+
+/* global DOMPurify, GM_setValue, GM_getValue, GM_registerMenuCommand, GM_log, GM_info */
+
+(function() {
+    'use strict';
+
+    // --- Constants ---
+    const SCRIPT_PREFIX = 'RACF';
+    const DEBOUNCE_DELAY_MS = 250;
+    const STATS_SAVE_DEBOUNCE_MS = 2000;
+    const CONFIG_STORAGE_KEY = 'config_v2.0'; // Keep same key as 2.2.0 unless structure changes again
+    const STATS_STORAGE_KEY = 'stats_v1';
+    const RULE_TYPES = ['keyword', 'user', 'subreddit']; // Regex is handled within keyword
+    const FILTER_ACTIONS = ['hide', 'blur', 'border', 'collapse', 'replace_text'];
+    const DEBUG_LOGGING = false; // Set to true for detailed console logs
+
+    // --- Default Structures ---
+    const DEFAULT_CONFIG = {
+        rules: [], // Global rules
+        filterGroups: [], // Array of {id: string, name: string, enabled: boolean, rules: []}
+        filterTypes: ['posts', 'comments'],
+        filterAction: 'hide',
+        whitelist: { subreddits: [], users: [] },
+        blacklist: { subreddits: [], users: [] },
+        uiVisible: true,
+        activeTab: 'settings', // Default tab
+        uiPosition: {
+            top: '100px',
+            left: null,
+            right: '20px',
+            width: '450px', // Slightly wider default for groups tab
+            height: null
+        }
+    };
+    const DEFAULT_STATS = {
+        totalProcessed: 0, totalFiltered: 0, totalWhitelisted: 0,
+        filteredByType: { posts: 0, comments: 0, messages: 0 },
+        filteredByRule: {}, // Key format: "[GLOBAL] [type] text" or "[GROUP:GroupName] [type] text"
+        filteredByAction: { hide: 0, blur: 0, border: 0, collapse: 0, replace_text: 0 }
+    };
+
+    // Simple unique ID generator for groups
+    const generateGroupId = () => `group_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+
+    if (!window.MutationObserver) { GM_log(`[${SCRIPT_PREFIX}] MutationObserver not supported.`); }
+
+    class RedditFilter {
+        constructor() {
+            this.config = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+            this.stats = JSON.parse(JSON.stringify(DEFAULT_STATS));
+            this.processedNodes = new WeakSet();
+            this.selectors = {};
+            this.isOldReddit = false;
+            this.observer = null;
+            this.uiContainer = null;
+            this.shadowRoot = null;
+            this.scrollTimer = null;
+            this.lastFilterTime = 0;
+            this.filterApplyDebounceTimer = null;
+            this.statsSaveDebounceTimer = null;
+            this.uiUpdateDebounceTimer = null;
+            this.isDragging = false;
+            this.dragStartX = 0;
+            this.dragStartY = 0;
+            this.dragInitialLeft = 0;
+            this.dragInitialTop = 0;
+            this.domPurify = (typeof DOMPurify === 'undefined') ? { sanitize: (t) => t } : DOMPurify;
+            this.originalContentCache = new WeakMap();
+            this.editingGroupId = null; // Track which group is being edited ('new' or group.id)
+            this.groupEditorRules = []; // Temporary store for rules *while editing* a group
+        }
+
+        log(message) {
+            GM_log(`[${SCRIPT_PREFIX}] ${message}`);
+        }
+
+        debugLog(message, ...args) {
+            if (DEBUG_LOGGING) {
+                console.log(`[${SCRIPT_PREFIX} DEBUG] ${message}`, ...args);
+            }
+        }
+
+        async init() {
+            this.log(`Initializing v${GM_info?.script?.version || '2.2.1'}...`);
+            try {
+                await this.loadConfig();
+                await this.loadStats();
+                this.detectRedditVersion();
+                this.injectUI();
+                this.updateUI(); // Initial UI render
+                this.registerMenuCommands();
+                this.initializeObserver();
+                this.addScrollListener();
+                setTimeout(() => this.applyFilters(document.body), 500); // Initial filter run
+                this.log(`Initialization complete.`);
+            } catch (error) {
+                this.log(`Init failed: ${error.message}`);
+                console.error(`[${SCRIPT_PREFIX}] Init failed:`, error);
+            }
+        }
+
+        // --- Config & Stats Management ---
+        async loadConfig() {
+            // (No changes from v2.2.0 needed here)
+            try {
+                const savedConfigString = await GM_getValue(CONFIG_STORAGE_KEY, null);
+                if (savedConfigString) {
+                    const parsedConfig = JSON.parse(savedConfigString);
+                    // Merge saved config with defaults, ensuring all keys exist
+                    this.config = {
+                        ...DEFAULT_CONFIG,
+                        ...parsedConfig,
+                        rules: Array.isArray(parsedConfig.rules) ? parsedConfig.rules : [],
+                        filterGroups: Array.isArray(parsedConfig.filterGroups) ? parsedConfig.filterGroups : [],
+                        filterTypes: Array.isArray(parsedConfig.filterTypes) ? parsedConfig.filterTypes : DEFAULT_CONFIG.filterTypes,
+                        filterAction: FILTER_ACTIONS.includes(parsedConfig.filterAction) ? parsedConfig.filterAction : DEFAULT_CONFIG.filterAction,
+                        whitelist: { ...DEFAULT_CONFIG.whitelist, ...(parsedConfig.whitelist || {}) },
+                        blacklist: { ...DEFAULT_CONFIG.blacklist, ...(parsedConfig.blacklist || {}) },
+                        uiPosition: { ...DEFAULT_CONFIG.uiPosition, ...(parsedConfig.uiPosition || {}) },
+                        uiVisible: typeof parsedConfig.uiVisible === 'boolean' ? parsedConfig.uiVisible : DEFAULT_CONFIG.uiVisible,
+                        activeTab: typeof parsedConfig.activeTab === 'string' ? parsedConfig.activeTab : DEFAULT_CONFIG.activeTab,
+                    };
+                    // Validate filterGroups structure (simple validation)
+                    this.config.filterGroups = this.config.filterGroups.filter(g => g && g.id && typeof g.name === 'string' && typeof g.enabled === 'boolean' && Array.isArray(g.rules));
+                    this.log(`Config loaded.`);
+                } else {
+                    this.log(`No saved config found. Using defaults.`);
+                    this.config = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+                }
+            } catch (e) {
+                this.log(`Failed to load config: ${e.message}. Using defaults.`);
+                this.config = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+                await this.saveConfig();
+            }
+        }
+
+        async saveConfig() {
+            // (No changes from v2.2.0 needed here)
+            try {
+                // Ensure basic structure before saving
+                if (!this.config) this.config = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+                if (!Array.isArray(this.config.rules)) this.config.rules = [];
+                if (!Array.isArray(this.config.filterGroups)) this.config.filterGroups = [];
+                if (!this.config.whitelist) this.config.whitelist = { subreddits: [], users: [] };
+                if (!this.config.blacklist) this.config.blacklist = { subreddits: [], users: [] };
+                this.config.uiPosition = { ...DEFAULT_CONFIG.uiPosition, ...(this.config.uiPosition || {}) };
+                if (!FILTER_ACTIONS.includes(this.config.filterAction)) this.config.filterAction = DEFAULT_CONFIG.filterAction;
+                if (!this.config.filterTypes) this.config.filterTypes = DEFAULT_CONFIG.filterTypes;
+
+                await GM_setValue(CONFIG_STORAGE_KEY, JSON.stringify(this.config));
+                 this.debugLog("Config saved:", this.config);
+            } catch (e) {
+                this.log(`Failed to save config: ${e.message}`);
+                console.error(`[${SCRIPT_PREFIX}] Failed save config:`, e);
+            }
+        }
+
+        async loadStats() {
+            // (No changes from v2.1.1 needed here)
+            try {
+                const savedStatsString = await GM_getValue(STATS_STORAGE_KEY, null);
+                if (savedStatsString) {
+                    const parsedStats = JSON.parse(savedStatsString);
+                    const defaultActions = DEFAULT_STATS.filteredByAction;
+                    const loadedActions = parsedStats.filteredByAction || {};
+                    const mergedActions = { ...defaultActions };
+                    for (const action in loadedActions) {
+                        if (FILTER_ACTIONS.includes(action)) {
+                            mergedActions[action] = loadedActions[action];
+                        }
+                    }
+                    this.stats = {
+                        ...DEFAULT_STATS,
+                        ...parsedStats,
+                        filteredByType: { ...DEFAULT_STATS.filteredByType, ...(parsedStats.filteredByType || {}) },
+                        filteredByRule: { ...DEFAULT_STATS.filteredByRule, ...(parsedStats.filteredByRule || {}) },
+                        filteredByAction: mergedActions
+                    };
+                } else {
+                    this.log(`No saved stats found. Using defaults.`);
+                    this.stats = JSON.parse(JSON.stringify(DEFAULT_STATS));
+                }
+            } catch (e) {
+                this.log(`Failed to load stats: ${e.message}. Resetting.`);
+                this.stats = JSON.parse(JSON.stringify(DEFAULT_STATS));
+                await this.saveStats();
+            }
+        }
+
+        async saveStats() {
+            // (No changes from v2.1.1 needed here)
+             try {
+                await GM_setValue(STATS_STORAGE_KEY, JSON.stringify(this.stats));
+            } catch (e) {
+                this.log(`Failed to save stats: ${e.message}`);
+            }
+        }
+
+        debouncedSaveStats() {
+            // (No changes from v2.1.1 needed here)
+            if (this.statsSaveDebounceTimer) clearTimeout(this.statsSaveDebounceTimer);
+            this.statsSaveDebounceTimer = setTimeout(async () => {
+                await this.saveStats();
+                this.statsSaveDebounceTimer = null;
+            }, STATS_SAVE_DEBOUNCE_MS);
+        }
+
+        async resetStats() {
+            // (No changes from v2.1.1 needed here)
+             if (confirm("Reset all filter statistics? This cannot be undone.")) {
+                this.stats = JSON.parse(JSON.stringify(DEFAULT_STATS));
+                await this.saveStats();
+                this.updateUI();
+                this.log(`Stats reset.`);
+            }
+        }
+
+        // --- Reddit Version Detection ---
+        detectRedditVersion() {
+            // (No changes from v2.1.1 needed here)
+             const isOldDomain = window.location.hostname === 'old.reddit.com';
+             const hasOldBodyClass = document.body.classList.contains('listing-page') || document.body.classList.contains('comments-page');
+             if (isOldDomain || hasOldBodyClass) {
+                 this.isOldReddit = true;
+                 this.selectors = {
+                    post: '.thing.link:not(.promoted)',
+                    comment: '.thing.comment',
+                    postSubredditSelector: '.tagline .subreddit',
+                    postAuthorSelector: '.tagline .author',
+                    commentAuthorSelector: '.tagline .author',
+                    postTitleSelector: 'a.title',
+                    postBodySelector: '.usertext-body .md, .expando .usertext-body .md',
+                    commentBodySelector: '.usertext-body .md',
+                    commentEntry: '.entry',
+                    commentContentContainer: '.child'
+                 };
+                 this.log(`Old Reddit detected.`);
+             } else {
+                 this.isOldReddit = false;
+                 this.selectors = {
+                     post: 'shreddit-post',
+                     comment: 'shreddit-comment',
+                     postSubredditSelector: '[slot="subreddit-name"]', // Common new Reddit selector
+                     postAuthorSelector: '[slot="author-name"]', // Common new Reddit selector
+                     commentAuthorSelector: '[slot="author-name"]', // Common new Reddit selector
+                     postTitleSelector: '[slot="title"]', // Common new Reddit selector
+                     postBodySelector: '#post-rtjson-content, [data-post-click-location="text-body"], [slot="text-body"]', // Various new Reddit body selectors
+                     commentBodySelector: 'div[slot="comment"]', // Common new Reddit comment body container
+                     commentEntry: ':host', // Approximation for the shreddit-comment itself
+                     commentContentContainer: '[slot="comment"]' // Where the text often resides
+                 };
+                 this.log(`New Reddit detected.`);
+             }
+             this.selectors.message = '.message'; // Basic message selector, might need refinement
+        }
+
+        // --- UI Injection & Styling ---
+        injectUI() {
+            // (No changes from v2.2.0 needed here - HTML structure is the same)
+            if (this.uiContainer) return;
+
+            this.uiContainer = document.createElement('div');
+            this.uiContainer.id = `${SCRIPT_PREFIX}-ui-container`;
+
+            // Apply saved or default position/size
+            const pos = this.config.uiPosition;
+            let initialPositionStyle = `position: fixed; z-index: 9999; `;
+            initialPositionStyle += `top: ${pos.top || DEFAULT_CONFIG.uiPosition.top}; `;
+            if (pos.left !== null && pos.left !== undefined) {
+                initialPositionStyle += `left: ${pos.left}; right: auto; `;
+            } else {
+                initialPositionStyle += `left: auto; right: ${pos.right || DEFAULT_CONFIG.uiPosition.right}; `;
+            }
+            initialPositionStyle += `resize: both; overflow: auto; min-width: 380px; min-height: 250px; `; // Min height adjusted
+
+            this.uiContainer.style.cssText = initialPositionStyle;
+            if (pos.width && pos.width !== 'auto') this.uiContainer.style.width = pos.width;
+            if (pos.height && pos.height !== 'auto') this.uiContainer.style.height = pos.height;
+            this.uiContainer.style.display = this.config.uiVisible ? 'block' : 'none';
+
+            this.shadowRoot = this.uiContainer.attachShadow({ mode: 'open' });
+
+            // --- UI HTML ---
+            const uiContent = document.createElement('div');
+            // Using innerHTML for simplicity, same structure as v2.2.0
+            uiContent.innerHTML = `
+                 <div class="racf-card">
+                      <div class="racf-tabs" id="racf-drag-handle">
+                          <button class="racf-tab-btn" data-tab="settings">Settings</button>
+                          <button class="racf-tab-btn" data-tab="groups">Groups</button> <!-- New Tab -->
+                          <button class="racf-tab-btn" data-tab="stats">Statistics</button>
+                      </div>
+                     <button id="racf-close-btn" class="racf-close-btn" title="Close Panel">×</button>
+
+                     <!-- Settings Tab Content -->
+                     <div id="racf-settings-content" class="racf-tab-content">
+                         <h4>Global Filter Settings</h4>
+                         <div class="racf-add-rule-section">
+                            <h5>Add Global Rule</h5>
+                             <div class="racf-input-group">
+                                 <label for="racf-rule-input">Rule Text:</label>
+                                 <input type="text" id="racf-rule-input" placeholder="Keyword, /regex/, user, subreddit">
+                             </div>
+                             <div class="racf-input-group">
+                                 <label for="racf-rule-type">Rule Type:</label>
+                                 <select id="racf-rule-type">
+                                     <option value="keyword" selected>Keyword/Regex</option>
+                                     <option value="user">User</option>
+                                     <option value="subreddit">Subreddit</option>
+                                 </select>
+                             </div>
+                             <div class="racf-input-group">
+                                 <label for="racf-rule-target">Apply In:</label>
+                                 <select id="racf-rule-target">
+                                     <option value="both" selected>Title & Body</option>
+                                     <option value="title">Title Only</option>
+                                     <option value="body">Body Only</option>
+                                 </select>
+                             </div>
+                             <div class="racf-input-group racf-checkbox-group">
+                                 <label for="racf-rule-normalize">Normalize:</label>
+                                 <input type="checkbox" id="racf-rule-normalize" title="Ignore accents/case (Keywords only, not Regex)">
+                                 <small>(Keywords only)</small>
+                             </div>
+                             <button id="racf-add-rule-btn">Add Global Rule</button>
+                         </div>
+                         <div class="racf-section">
+                             <label>Filter Types:</label>
+                             <label><input type="checkbox" class="racf-filter-type" value="posts"> Posts</label>
+                             <label><input type="checkbox" class="racf-filter-type" value="comments"> Comments</label>
+                         </div>
+                         <div class="racf-section">
+                             <label for="racf-filter-action">Filter Action:</label>
+                             <select id="racf-filter-action"></select>
+                         </div>
+                         <div class="racf-section">
+                             <label>Active Global Rules (<span id="racf-rule-count">0</span>):</label>
+                             <ul id="racf-rule-list"></ul>
+                         </div>
+                         <div class="racf-section">
+                             <small>Whitelists/Blacklists apply globally. Manage via JSON Import/Export.</small>
+                         </div>
+                         <div class="racf-section racf-buttons">
+                             <button id="racf-import-btn">Import (.json)</button>
+                             <button id="racf-export-btn">Export (.json)</button>
+                             <input type="file" id="racf-import-file-input" accept=".json" style="display: none;">
+                         </div>
+                         <div class="racf-section racf-buttons">
+                             <button id="racf-clear-processed-btn">Clear Processed Cache</button>
+                         </div>
+                     </div>
+
+                     <!-- Groups Tab Content -->
+                     <div id="racf-groups-content" class="racf-tab-content">
+                         <h4>Filter Groups</h4>
+                         <div id="racf-group-list-container" class="racf-section">
+                             <button id="racf-create-group-btn" class="racf-action-btn">＋ Create New Group</button>
+                             <label>Your Groups (<span id="racf-group-count">0</span>):</label>
+                             <ul id="racf-group-list"></ul>
+                         </div>
+                         <div id="racf-group-editor" class="racf-section racf-editor-box" style="display: none;">
+                             <h5 id="racf-group-editor-title">Edit Group</h5>
+                             <div class="racf-input-group">
+                                 <label for="racf-group-editor-name">Group Name:</label>
+                                 <input type="text" id="racf-group-editor-name" placeholder="e.g., Politics, News, Work">
+                             </div>
+                             <div class="racf-add-rule-section racf-group-rule-adder">
+                                <h5>Add Rule to this Group</h5>
+                                <div class="racf-input-group">
+                                    <label for="racf-group-rule-input">Rule Text:</label>
+                                    <input type="text" id="racf-group-rule-input" placeholder="Keyword, /regex/, user, sub">
+                                </div>
+                                <div class="racf-input-group">
+                                    <label for="racf-group-rule-type">Type:</label>
+                                    <select id="racf-group-rule-type">
+                                        <option value="keyword" selected>Keyword/Regex</option>
+                                        <option value="user">User</option>
+                                        <option value="subreddit">Subreddit</option>
+                                    </select>
+                                </div>
+                                <div class="racf-input-group">
+                                    <label for="racf-group-rule-target">Apply In:</label>
+                                    <select id="racf-group-rule-target">
+                                        <option value="both" selected>Title & Body</option>
+                                        <option value="title">Title Only</option>
+                                        <option value="body">Body Only</option>
+                                    </select>
+                                </div>
+                                <div class="racf-input-group racf-checkbox-group">
+                                    <label for="racf-group-rule-normalize">Norm:</label>
+                                    <input type="checkbox" id="racf-group-rule-normalize" title="Normalize (Keywords only)">
+                                    <small>(Kw)</small>
+                                </div>
+                                <button id="racf-group-add-rule-btn">Add Rule to Group</button>
+                             </div>
+                             <div class="racf-section">
+                                 <label>Rules in this Group (<span id="racf-group-editor-rule-count">0</span>):</label>
+                                 <ul id="racf-group-rule-list"></ul>
+                             </div>
+                             <div class="racf-buttons">
+                                 <button id="racf-group-save-btn" class="racf-action-btn-positive">Save Group</button>
+                                 <button id="racf-group-cancel-btn" class="racf-action-btn-secondary">Cancel</button>
+                             </div>
+                         </div>
+                     </div>
+
+                     <!-- Statistics Tab Content -->
+                     <div id="racf-stats-content" class="racf-tab-content">
+                         <h4>Filter Statistics</h4>
+                         <div class="racf-stats-grid">
+                             <div>Total Processed:</div><div id="racf-stats-processed">0</div>
+                             <div>Total Filtered:</div><div id="racf-stats-filtered">0</div>
+                             <div>Filtering Rate:</div><div id="racf-stats-rate">0%</div>
+                             <div>Total Whitelisted:</div><div id="racf-stats-whitelisted">0</div>
+                             <div>Filtered Posts:</div><div id="racf-stats-type-posts">0</div>
+                             <div>Filtered Comments:</div><div id="racf-stats-type-comments">0</div>
+                             <div>Action - Hide:</div><div id="racf-stats-action-hide">0</div>
+                             <div>Action - Blur:</div><div id="racf-stats-action-blur">0</div>
+                             <div>Action - Border:</div><div id="racf-stats-action-border">0</div>
+                             <div>Action - Collapse:</div><div id="racf-stats-action-collapse">0</div>
+                             <div>Action - Replace Text:</div><div id="racf-stats-action-replace_text">0</div>
+                         </div>
+                         <div class="racf-section">
+                             <label>Most Active Rules:</label>
+                             <ul id="racf-stats-rule-list"><li>No rules active yet.</li></ul>
+                         </div>
+                         <div class="racf-section racf-buttons">
+                             <button id="racf-reset-stats-btn" class="racf-action-btn-negative">Reset Statistics</button>
+                         </div>
+                     </div>
+                 </div>`;
+
+            // --- CSS Styles ---
+            const styles = document.createElement('style');
+            // Styles are identical to v2.2.0
+            styles.textContent = `
+                :host { font-family: sans-serif; font-size: 14px; }
+                .racf-card {
+                    background-color: #f9f9f9; border: 1px solid #ccc; border-radius: 5px; padding: 0;
+                    box-shadow: 0 2px 5px rgba(0,0,0,.2); position: relative; color: #333;
+                    height: 100%; display: flex; flex-direction: column;
+                    overflow: hidden; /* Prevent content overflow during resize */
+                }
+                .racf-tabs { display: flex; border-bottom: 1px solid #ccc; cursor: move; user-select: none; flex-shrink: 0; background-color: #e9ecef; }
+                .racf-tab-btn {
+                    flex: 1; padding: 10px 15px; background: #e9ecef; border: none;
+                    border-right: 1px solid #dee2e6; cursor: pointer; font-size: 14px; color: #495057;
+                    transition: background-color 0.2s, color 0.2s, border-color 0.2s;
+                }
+                .racf-tab-btn:last-child { border-right: none; }
+                .racf-tab-btn:hover { background: #d3d9df; color: #212529; }
+                .racf-tab-btn.active {
+                    background: #f9f9f9; color: #0056b3; border-bottom: 1px solid #f9f9f9;
+                    border-top: 3px solid #007bff; margin-bottom: -1px; font-weight: 700;
+                }
+                .racf-tab-content { display: none; padding: 15px; flex-grow: 1; overflow-y: auto; background-color: #f9f9f9;}
+                .racf-tab-content.active { display: block; }
+                .racf-card h4 { margin-top: 0; margin-bottom: 15px; border-bottom: 1px solid #eee; padding-bottom: 10px; color: #0056b3; }
+                .racf-card h5 { margin-top: 10px; margin-bottom: 8px; color: #495057; font-size: 1.1em; }
+                .racf-section { margin-bottom: 15px; }
+                .racf-section small { font-weight: normal; font-style: italic; color: #555; font-size: 0.9em; }
+                .racf-add-rule-section { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; align-items: flex-end; margin-bottom: 15px; padding: 10px; border: 1px solid #e0e0e0; border-radius: 4px; background-color: #fdfdfd; }
+                .racf-add-rule-section h5 { grid-column: 1 / -1; margin-bottom: 10px; border-bottom: 1px dashed #ccc; padding-bottom: 5px; }
+                .racf-input-group { display: flex; flex-direction: column; gap: 3px; }
+                .racf-input-group label { font-size: .9em; font-weight: 700; color: #495057; }
+                .racf-checkbox-group { flex-direction: row; align-items: center; gap: 5px; margin-top: auto; }
+                .racf-checkbox-group label { margin-bottom: 0; }
+                .racf-checkbox-group small { margin-left: 0; font-style: normal; font-size: 0.85em;}
+                input[type=text], select { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 3px; box-sizing: border-box; font-size: 14px; background-color: #fff; color: #212529; }
+                input[type=text]:focus, select:focus { border-color: #80bdff; outline: 0; box-shadow: 0 0 0 0.2rem rgba(0,123,255,.25); }
+                .racf-section input[type=checkbox] { margin-right: 3px; vertical-align: middle; }
+                .racf-section label+label { margin-left: 10px; font-weight: 400; }
+                button { padding: 8px 12px; border: 1px solid #adb5bd; background-color: #f8f9fa; color: #212529; border-radius: 3px; cursor: pointer; font-size: 14px; transition: background-color 0.15s ease-in-out, border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out, color 0.15s ease-in-out; }
+                button:hover { background-color: #e9ecef; border-color: #a1a8af; color: #212529; }
+                button:active { background-color: #dee2e6; border-color: #939ba1; }
+                #racf-add-rule-btn, #racf-group-add-rule-btn { background-color: #007bff; color: #fff; border-color: #007bff; font-weight: bold; padding: 8px 15px; margin-top: 10px; grid-column: 1 / -1; }
+                #racf-add-rule-btn:hover, #racf-group-add-rule-btn:hover { background-color: #0056b3; border-color: #0056b3; }
+                 /* Specific button styles */
+                .racf-action-btn { background-color: #17a2b8; color: #fff; border-color: #17a2b8; } /* Info */
+                .racf-action-btn:hover { background-color: #138496; border-color: #117a8b; }
+                .racf-action-btn-positive { background-color: #28a745; color: #fff; border-color: #28a745; } /* Success */
+                .racf-action-btn-positive:hover { background-color: #218838; border-color: #1e7e34; }
+                .racf-action-btn-negative { background-color: #dc3545; color: #fff; border-color: #dc3545; } /* Danger */
+                .racf-action-btn-negative:hover { background-color: #c82333; border-color: #bd2130; }
+                .racf-action-btn-secondary { background-color: #6c757d; color: #fff; border-color: #6c757d; } /* Secondary */
+                .racf-action-btn-secondary:hover { background-color: #5a6268; border-color: #545b62; }
+
+                #racf-import-btn, #racf-export-btn { background-color: #28a745; color: #fff; border-color: #28a745; }
+                #racf-import-btn:hover, #racf-export-btn:hover { background-color: #218838; border-color: #1e7e34; }
+                #racf-clear-processed-btn { background-color: #6c757d; color: #fff; border-color: #6c757d; }
+                #racf-clear-processed-btn:hover { background-color: #5a6268; border-color: #545b62; }
+                #racf-reset-stats-btn { /* Already negative */ }
+
+                #racf-rule-list, #racf-stats-rule-list, #racf-group-list, #racf-group-rule-list { list-style: none; padding: 0; max-height: 180px; overflow-y: auto; border: 1px solid #eee; margin-top: 5px; background: #fff; }
+                #racf-rule-list li, #racf-stats-rule-list li, #racf-group-list li, #racf-group-rule-list li { padding: 6px 10px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; font-size: 12px; }
+                #racf-rule-list li:last-child, #racf-stats-rule-list li:last-child, #racf-group-list li:last-child, #racf-group-rule-list li:last-child { border-bottom: none; }
+                .racf-rule-details { flex-grow: 1; margin-right: 10px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+                .racf-rule-type-badge { font-size: .8em; padding: 1px 4px; border-radius: 3px; background-color: #6c757d; color: #fff; flex-shrink: 0; text-transform: uppercase; }
+                .racf-rule-text { word-break: break-all; font-family: monospace; background: #e9ecef; padding: 1px 3px; border-radius: 2px; color: #212529;}
+                .racf-rule-actions button, .racf-group-actions button { background: #dc3545; border: 1px solid #dc3545; color: #fff; padding: 3px 7px; font-size: 11px; margin-left: 5px; flex-shrink: 0; line-height: 1; }
+                .racf-rule-actions button:hover, .racf-group-actions button:hover { background-color: #c82333; border-color: #bd2130; }
+                 /* Group list specific styles */
+                #racf-group-list li { gap: 10px; }
+                #racf-group-list .racf-group-name { font-weight: bold; flex-grow: 1; margin-left: 5px; }
+                #racf-group-list .racf-group-actions button { padding: 4px 8px; font-size: 12px; }
+                #racf-group-list .racf-edit-group-btn { background-color: #ffc107; border-color: #ffc107; color: #212529; } /* Warning */
+                #racf-group-list .racf-edit-group-btn:hover { background-color: #e0a800; border-color: #d39e00; }
+                #racf-group-list .racf-delete-group-btn { /* Already negative */ }
+                #racf-group-list input[type=checkbox] { flex-shrink: 0; transform: scale(1.1); }
+                 /* Group editor styles */
+                .racf-editor-box { border: 1px solid #adb5bd; border-radius: 4px; padding: 15px; background-color: #f0f0f0; margin-top: 15px; }
+                .racf-group-rule-adder { background-color: #f8f9fa; padding-top: 5px; margin-top: 15px; }
+                .racf-group-rule-adder h5 { font-size: 1em; margin-top: 0; }
+                #racf-group-rule-list { max-height: 150px; } /* Adjust height */
+
+
+                #racf-stats-rule-list .racf-rule-text { flex-grow: 1; margin-right: 10px; word-break: break-all; font-family: monospace; background: #e9ecef; padding: 1px 3px; border-radius: 2px; color: #212529;}
+                #racf-stats-rule-list .racf-rule-count { font-weight: 700; margin-left: 10px; flex-shrink: 0; background-color: #007bff; color: #fff; padding: 2px 5px; border-radius: 10px; font-size: 0.9em;}
+                .racf-buttons { margin-top: 15px; border-top: 1px solid #eee; padding-top: 10px; display: flex; gap: 10px; flex-wrap: wrap; flex-shrink: 0; }
+                .racf-buttons button { flex-grow: 1; margin: 0; }
+                .racf-close-btn { position: absolute; top: 5px; right: 10px; background: 0 0; border: none; font-size: 24px; font-weight: 700; color: #6c757d; cursor: pointer; z-index: 10; margin: 0 !important; padding: 0 5px; line-height: 1; }
+                .racf-close-btn:hover { color: #343a40; }
+                .racf-stats-grid { display: grid; grid-template-columns: auto 1fr; gap: 5px 10px; margin-bottom: 15px; font-size: 13px; }
+                .racf-stats-grid div:nth-child(odd) { font-weight: 700; text-align: right; color: #495057; }
+                .racf-stats-grid div:nth-child(even) { font-family: monospace; color: #0056b3; }
+
+                #racf-create-group-btn { margin-bottom: 10px; width: 100%; }
+            `;
+
+
+            this.shadowRoot.appendChild(styles);
+            this.shadowRoot.appendChild(uiContent);
+            this.injectGlobalStyles(); // Apply styles for filtered elements
+            document.body.insertAdjacentElement('beforeend', this.uiContainer);
+            this.addUIEventListeners();
+            this.log(`UI injected with Groups tab, resize, and wide drag area enabled.`);
+        }
+
+        injectGlobalStyles() {
+             // (No changes from v2.1.1 needed here)
+             const styleId = `${SCRIPT_PREFIX}-global-styles`;
+             let globalStyleSheet = document.getElementById(styleId);
+             if (!globalStyleSheet) {
+                 globalStyleSheet = document.createElement("style");
+                 globalStyleSheet.id = styleId;
+                 document.head.appendChild(globalStyleSheet);
+             }
+             // Selectors might need adjustment based on Old/New Reddit detection
+             const commentEntrySelector = this.selectors.commentEntry || '.comment';
+             const commentContentContainerSelector = this.selectors.commentContentContainer || '.child';
+             const commentTaglineSelector = this.isOldReddit ? '.entry > .tagline' : 'header'; // Simplified for example
+             const commentFormSelector = this.isOldReddit ? '.entry > form' : 'shreddit-composer'; // Simplified
+
+             globalStyleSheet.textContent = `
+                 .${SCRIPT_PREFIX}-hide { display: none !important; height: 0 !important; overflow: hidden !important; margin: 0 !important; padding: 0 !important; border: none !important; visibility: hidden !important; }
+                 .${SCRIPT_PREFIX}-blur { filter: blur(5px) !important; transition: filter 0.2s ease; cursor: pointer; }
+                 .${SCRIPT_PREFIX}-blur:hover { filter: none !important; }
+                 .${SCRIPT_PREFIX}-border { outline: 3px solid red !important; outline-offset: -1px; }
+                 /* Collapse styles need refinement based on actual DOM */
+                 .${SCRIPT_PREFIX}-collapse > ${commentContentContainerSelector},
+                 .${SCRIPT_PREFIX}-collapse ${commentFormSelector} { display: none !important; }
+                 /* Old Reddit specific collapse */
+                 .${SCRIPT_PREFIX}-collapse.thing.comment > .entry > .child,
+                 .${SCRIPT_PREFIX}-collapse.thing.comment > .entry > .usertext { display: none !important; }
+                 .${SCRIPT_PREFIX}-collapse > ${commentTaglineSelector} { opacity: 0.6 !important; }
+                 .${SCRIPT_PREFIX}-collapse > ${commentTaglineSelector}::after,
+                 .${SCRIPT_PREFIX}-collapse.thing.comment > .entry > .tagline::after { /* Check selector */
+                     content: " [Filtered]"; font-style: italic; font-size: 0.9em; color: grey;
+                     margin-left: 5px; display: inline; vertical-align: baseline;
+                 }
+                 /* Hide just removes the element */
+                 .${SCRIPT_PREFIX}-hide.thing.comment,
+                 .${SCRIPT_PREFIX}-hide.shreddit-comment { }
+                 /* Text replacement styling */
+                 .${SCRIPT_PREFIX}-text-replaced .usertext-body .md p,
+                 .${SCRIPT_PREFIX}-text-replaced div[slot="comment"] p {
+                     color: grey; font-style: italic; margin: 0; padding: 5px 0;
+                 }
+                 /* Ensure filter reason tooltip shows */
+                 [data-racf-filter-reason] {
+                    /* No specific style needed unless overriding something */
+                 }
+             `;
+        }
+
+        addUIEventListeners() {
+            // (No changes from v2.2.0 needed here)
+            if (!this.shadowRoot) return;
+            const q = (s) => this.shadowRoot.querySelector(s);
+            const qa = (s) => this.shadowRoot.querySelectorAll(s);
+
+            // --- Dragging Listener (on the card, preventing on interactive elements) ---
+            const cardElement = q('.racf-card');
+            if (cardElement) {
+                cardElement.addEventListener('mousedown', this.dragMouseDown.bind(this));
+            } else {
+                this.log("Error: Card element (.racf-card) not found for attaching drag listener.");
+            }
+
+            // --- Tab Switching ---
+            qa('.racf-tab-btn').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    e.stopPropagation(); // Prevent drag start when clicking tabs
+                    const tabId = e.target.dataset.tab;
+                    if (!tabId) return;
+                    qa('.racf-tab-btn').forEach(b => b.classList.remove('active'));
+                    qa('.racf-tab-content').forEach(c => c.classList.remove('active'));
+                    e.target.classList.add('active');
+                    const contentEl = q(`#racf-${tabId}-content`);
+                    if (contentEl) contentEl.classList.add('active');
+                    this.config.activeTab = tabId;
+                    // Don't save config just for tab switch, but update UI if needed (e.g., stats)
+                    if (tabId === 'stats' || tabId === 'groups') {
+                         this.hideGroupEditor(); // Hide editor when switching away from/to groups tab initially
+                         this.updateUI();
+                    }
+                    this.debugLog("Switched to tab:", tabId);
+                });
+            });
+
+            // --- Settings Tab Listeners ---
+            q('#racf-add-rule-btn').addEventListener('click', () => this.handleAddRule()); // Global rule
+            q('#racf-rule-input').addEventListener('keypress', (e) => { if (e.key === 'Enter') this.handleAddRule(); });
+            q('#racf-rule-list').addEventListener('click', (e) => { // Global rule list
+                 e.stopPropagation();
+                 const removeButton = e.target.closest('button.racf-remove-rule-btn'); // Specific class
+                 if (removeButton) {
+                    const ruleIndex = parseInt(removeButton.dataset.ruleIndex, 10);
+                    if (!isNaN(ruleIndex)) { this.removeRuleByIndex(ruleIndex); }
+                    else { this.log(`Could not remove global rule: Invalid index.`); }
+                 }
+            });
+            qa('.racf-filter-type').forEach(cb => {
+                cb.addEventListener('change', (e) => this.handleFilterTypeChange(e));
+            });
+            const filterActionSelect = q('#racf-filter-action');
+            if (filterActionSelect) {
+                filterActionSelect.addEventListener('change', (e) => {
+                    const newAction = e.target.value;
+                    if (FILTER_ACTIONS.includes(newAction)) {
+                        this.config.filterAction = newAction;
+                        this.saveConfigAndApplyFilters(); // Action change needs re-apply
+                    } else {
+                        this.log(`Invalid filter action selected: ${newAction}`);
+                        e.target.value = this.config.filterAction; // Revert UI
+                    }
+                });
+            }
+            q('#racf-import-btn').addEventListener('click', () => { q('#racf-import-file-input')?.click(); });
+            q('#racf-import-file-input')?.addEventListener('change', (e) => this.importConfig(e));
+            q('#racf-export-btn').addEventListener('click', () => this.exportConfig());
+            q('#racf-clear-processed-btn').addEventListener('click', () => {
+                this.processedNodes = new WeakSet();
+                this.originalContentCache = new WeakMap();
+                this.log(`Processed node cache and original content cache cleared.`);
+                this.applyFilters(document.body); // Re-filter everything
+            });
+
+            // --- Groups Tab Listeners ---
+            q('#racf-create-group-btn').addEventListener('click', () => this.handleCreateGroup());
+            q('#racf-group-list').addEventListener('click', (e) => {
+                e.stopPropagation();
+                const target = e.target;
+                const groupLi = target.closest('li[data-group-id]');
+                if (!groupLi) return;
+                const groupId = groupLi.dataset.groupId;
+
+                if (target.classList.contains('racf-edit-group-btn')) {
+                    this.handleEditGroup(groupId);
+                } else if (target.classList.contains('racf-delete-group-btn')) {
+                    this.handleDeleteGroup(groupId);
+                } else if (target.type === 'checkbox' && target.classList.contains('racf-group-toggle')) {
+                    this.handleToggleGroup(groupId, target.checked);
+                }
+            });
+
+            // --- Group Editor Listeners ---
+            q('#racf-group-add-rule-btn').addEventListener('click', () => this.handleAddRuleToGroupEditor());
+            q('#racf-group-rule-input').addEventListener('keypress', (e) => { if (e.key === 'Enter') this.handleAddRuleToGroupEditor(); });
+            q('#racf-group-rule-list').addEventListener('click', (e) => { // Group rule list within editor
+                 e.stopPropagation();
+                 const removeButton = e.target.closest('button.racf-remove-group-rule-btn'); // Specific class for group editor rules
+                 if (removeButton) {
+                    const ruleIndex = parseInt(removeButton.dataset.ruleIndex, 10);
+                    if (!isNaN(ruleIndex)) { this.handleRemoveRuleFromGroupEditor(ruleIndex); }
+                    else { this.log(`Could not remove rule from group editor: Invalid index.`); }
+                 }
+            });
+            q('#racf-group-save-btn').addEventListener('click', () => this.handleSaveGroup());
+            q('#racf-group-cancel-btn').addEventListener('click', () => this.handleCancelGroup());
+
+
+            // --- Statistics Tab Listeners ---
+            q('#racf-reset-stats-btn').addEventListener('click', () => this.resetStats());
+
+            // --- General UI Listeners ---
+            q('#racf-close-btn').addEventListener('click', (e) => {
+                 e.stopPropagation(); // Prevent drag
+                 this.toggleUIVisibility(false)
+            });
+            // Resize end listener
+             if (this.uiContainer) {
+                 this.uiContainer.addEventListener('mouseup', () => {
+                    if (!this.isDragging) { // Only save dimensions if not dragging
+                         this.saveCurrentDimensions();
+                    }
+                 });
+             }
+        }
+
+        // --- Dragging Functionality (No changes from v2.1.1) ---
+        dragMouseDown(e) {
+            if (e.button !== 0) return;
+            const noDragElementsSelector = 'button, input, select, textarea, a, ul, li'; // Simplified, ul/li covers lists
+            const clickedElement = e.target;
+
+            // Check if the click originated within an interactive element or its descendants
+            if (clickedElement.closest(noDragElementsSelector)) {
+                 // Allow clicks on list items *unless* it's specifically a button/input/select/a inside
+                 const interactiveChild = clickedElement.closest('button, input, select, textarea, a');
+                 if(interactiveChild) {
+                    this.debugLog("Drag prevented: Clicked on interactive element.", clickedElement);
+                    return; // Prevent drag if a truly interactive element was the target
+                 }
+                 // If it's just text within a list item, allow drag to start
+            }
+
+             // Prevent drag if clicking on scrollbar (heuristic)
+             if (e.offsetX > clickedElement.clientWidth || e.offsetY > clickedElement.clientHeight) {
+                 this.debugLog("Drag prevented: Click likely on scrollbar.");
+                 return;
+             }
+
+            e.preventDefault();
+            e.stopPropagation();
+
+            this.isDragging = true;
+            this.dragStartX = e.clientX;
+            this.dragStartY = e.clientY;
+            const rect = this.uiContainer.getBoundingClientRect();
+            this.dragInitialTop = rect.top;
+            this.dragInitialLeft = rect.left;
+
+            this.elementDragBound = this.elementDrag.bind(this);
+            this.closeDragElementBound = this.closeDragElement.bind(this);
+            document.addEventListener('mousemove', this.elementDragBound);
+            document.addEventListener('mouseup', this.closeDragElementBound);
+
+            this.uiContainer.style.opacity = '0.9';
+            this.uiContainer.style.userSelect = 'none';
+        }
+
+        elementDrag(e) {
+            if (!this.isDragging) return;
+            e.preventDefault();
+            const deltaX = e.clientX - this.dragStartX;
+            const deltaY = e.clientY - this.dragStartY;
+            let newTop = this.dragInitialTop + deltaY;
+            let newLeft = this.dragInitialLeft + deltaX;
+            const containerRect = this.uiContainer.getBoundingClientRect();
+            // Basic boundary checks
+            newTop = Math.max(0, Math.min(newTop, window.innerHeight - containerRect.height));
+            newLeft = Math.max(0, Math.min(newLeft, window.innerWidth - containerRect.width));
+            this.uiContainer.style.top = `${newTop}px`;
+            this.uiContainer.style.left = `${newLeft}px`;
+            this.uiContainer.style.right = 'auto'; // Ensure left positioning takes precedence after drag
+        }
+
+        closeDragElement() {
+            if (!this.isDragging) return;
+            this.isDragging = false;
+            document.removeEventListener('mousemove', this.elementDragBound);
+            document.removeEventListener('mouseup', this.closeDragElementBound);
+            this.uiContainer.style.opacity = '1';
+            this.uiContainer.style.userSelect = '';
+            this.saveCurrentPositionAndDimensions(); // Save final position and dimensions
+        }
+
+        // --- Position/Dimension Saving (No changes from v2.1.1) ---
+        saveCurrentPositionAndDimensions() {
+             if (!this.uiContainer) return;
+             const rect = this.uiContainer.getBoundingClientRect();
+             this.config.uiPosition.top = `${rect.top}px`;
+             this.config.uiPosition.left = `${rect.left}px`;
+             this.config.uiPosition.right = null; // Always use left after manual interaction
+             this.config.uiPosition.width = `${rect.width}px`;
+             this.config.uiPosition.height = `${rect.height}px`;
+             this.saveConfig(); // Save immediately after drag/resize stops
+             this.debugLog("Saved position and dimensions:", this.config.uiPosition);
+        }
+
+         saveCurrentDimensions() {
+             if (!this.uiContainer || this.isDragging) return; // Don't save during drag
+             const rect = this.uiContainer.getBoundingClientRect();
+             let changed = false;
+             const newWidth = `${rect.width}px`;
+             const newHeight = `${rect.height}px`;
+             if (this.config.uiPosition.width !== newWidth) {
+                 this.config.uiPosition.width = newWidth;
+                 changed = true;
+             }
+              if (this.config.uiPosition.height !== newHeight) {
+                 this.config.uiPosition.height = newHeight;
+                 changed = true;
+             }
+             if (changed) {
+                 this.debugLog(`Saving dimensions after resize: W=${newWidth}, H=${newHeight}`);
+                 this.saveConfig(); // Save config if dimensions changed
+             }
+         }
+
+        // --- UI Update Logic ---
+        updateUI() {
+            // (No changes from v2.2.0 needed here - logic handles all tabs)
+            if (!this.shadowRoot || !this.uiContainer) return;
+            this.debugLog("Updating UI...");
+
+            // Set container visibility and position/size
+            this.uiContainer.style.display = this.config.uiVisible ? 'block' : 'none';
+            if (this.config.uiVisible) { // Only update position if visible
+                const pos = this.config.uiPosition;
+                this.uiContainer.style.top = pos.top || DEFAULT_CONFIG.uiPosition.top;
+                if (pos.left !== null && pos.left !== undefined) {
+                    this.uiContainer.style.left = pos.left;
+                    this.uiContainer.style.right = 'auto';
+                } else {
+                    this.uiContainer.style.left = 'auto';
+                    this.uiContainer.style.right = pos.right || DEFAULT_CONFIG.uiPosition.right;
+                }
+                 if (pos.width && pos.width !== 'auto') this.uiContainer.style.width = pos.width;
+                 if (pos.height && pos.height !== 'auto') this.uiContainer.style.height = pos.height;
+            }
+
+            const q = (s) => this.shadowRoot.querySelector(s);
+            const qa = (s) => this.shadowRoot.querySelectorAll(s);
+
+            // --- Update Settings Tab ---
+            const ruleListEl = q('#racf-rule-list');
+            if (ruleListEl) {
+                ruleListEl.innerHTML = ''; // Clear global rules
+                (this.config.rules || []).forEach((rule, index) => {
+                    ruleListEl.appendChild(this.createRuleListItem(rule, index, false)); // false = not group rule
+                });
+                const ruleCountEl = q('#racf-rule-count');
+                if (ruleCountEl) ruleCountEl.textContent = (this.config.rules || []).length;
+            }
+            qa('.racf-filter-type').forEach(cb => { cb.checked = (this.config.filterTypes || []).includes(cb.value); });
+            const actionSelect = q('#racf-filter-action');
+            if (actionSelect) {
+                if (actionSelect.options.length === 0) { // Populate only once
+                    FILTER_ACTIONS.forEach(action => {
+                        const option = document.createElement('option');
+                        option.value = action;
+                        switch(action) {
+                            case 'hide': option.textContent = 'Hide Completely'; break;
+                            case 'blur': option.textContent = 'Blur (Hover)'; break;
+                            case 'border': option.textContent = 'Red Border'; break;
+                            case 'collapse': option.textContent = 'Collapse (Comments)'; break;
+                            case 'replace_text': option.textContent = 'Replace Text (Comments)'; break;
+                            default: option.textContent = action.charAt(0).toUpperCase() + action.slice(1);
+                        }
+                        actionSelect.appendChild(option);
+                    });
+                }
+                actionSelect.value = this.config.filterAction;
+            }
+
+            // --- Update Groups Tab ---
+            const groupListEl = q('#racf-group-list');
+            const groupEditorEl = q('#racf-group-editor');
+            const groupListContainerEl = q('#racf-group-list-container');
+            if (groupListEl && groupEditorEl && groupListContainerEl) {
+                // Show/hide editor vs list
+                if (this.editingGroupId !== null) { // Covers 'new' or an actual ID
+                    groupEditorEl.style.display = 'block';
+                    groupListContainerEl.style.display = 'none'; // Hide list while editing
+                    this.renderGroupEditor(); // Populate editor (using this.editingGroupId and this.groupEditorRules)
+                } else {
+                    groupEditorEl.style.display = 'none';
+                    groupListContainerEl.style.display = 'block'; // Show list
+                    this.renderGroupList(groupListEl); // Populate list from config
+                }
+                const groupCountEl = q('#racf-group-count');
+                if(groupCountEl) groupCountEl.textContent = (this.config.filterGroups || []).length;
+            }
+
+
+            // --- Update Statistics Tab ---
+             const statsP = q('#racf-stats-processed'); if(statsP) statsP.textContent=this.stats.totalProcessed;
+             const statsF = q('#racf-stats-filtered'); if(statsF) statsF.textContent=this.stats.totalFiltered;
+             const statsR = q('#racf-stats-rate'); if(statsR) {const r = this.stats.totalProcessed>0?((this.stats.totalFiltered/this.stats.totalProcessed)*100).toFixed(1):0; statsR.textContent=`${r}%`;}
+             const statsW = q('#racf-stats-whitelisted'); if(statsW) statsW.textContent=this.stats.totalWhitelisted;
+             const statsTP = q('#racf-stats-type-posts'); if(statsTP) statsTP.textContent=this.stats.filteredByType?.posts||0;
+             const statsTC = q('#racf-stats-type-comments'); if(statsTC) statsTC.textContent=this.stats.filteredByType?.comments||0;
+             const statsAH = q('#racf-stats-action-hide'); if(statsAH) statsAH.textContent=this.stats.filteredByAction?.hide||0;
+             const statsAB = q('#racf-stats-action-blur'); if(statsAB) statsAB.textContent=this.stats.filteredByAction?.blur||0;
+             const statsAbo = q('#racf-stats-action-border'); if(statsAbo) statsAbo.textContent=this.stats.filteredByAction?.border||0;
+             const statsAC = q('#racf-stats-action-collapse'); if(statsAC) statsAC.textContent=this.stats.filteredByAction?.collapse||0;
+             const statsAR = q('#racf-stats-action-replace_text'); if(statsAR) statsAR.textContent=this.stats.filteredByAction?.replace_text||0;
+            // Only update rule stats list if stats tab is potentially active
+            if (this.config.activeTab === 'stats') {
+                const statsRuleListEl = q('#racf-stats-rule-list');
+                if (statsRuleListEl) {
+                    statsRuleListEl.innerHTML = '';
+                    const sortedRules = Object.entries(this.stats.filteredByRule || {})
+                                          .filter(([, count]) => count > 0)
+                                          .sort(([, countA], [, countB]) => countB - countA);
+                    if (sortedRules.length === 0) {
+                        statsRuleListEl.innerHTML = '<li>No rules triggered yet.</li>';
+                    } else {
+                        sortedRules.slice(0, 20).forEach(([ruleText, count]) => { // Limit displayed rules
+                            const li = document.createElement('li');
+                            const safeRuleText = this.domPurify.sanitize(ruleText, { USE_PROFILES: { html: false } });
+                            li.innerHTML = `<span class="racf-rule-text">${safeRuleText}</span><span class="racf-rule-count" title="Times triggered">${count}</span>`;
+                            statsRuleListEl.appendChild(li);
+                        });
+                    }
+                }
+            }
+
+            // --- Update Active Tab ---
+            const activeTabId = this.config.activeTab || 'settings';
+            qa('.racf-tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === activeTabId));
+            qa('.racf-tab-content').forEach(c => c.classList.toggle('active', c.id === `racf-${activeTabId}-content`));
+        }
+
+        // --- Helper for Creating Rule List Items ---
+        createRuleListItem(rule, index, isGroupRule = false) {
+            // (No changes from v2.2.0 needed here)
+            const li = document.createElement('li');
+            const safeText = this.domPurify.sanitize(rule.text || '', { USE_PROFILES: { html: false } });
+            const typeTitle = `Type: ${rule.type}`;
+            const regexTitle = rule.isRegex ? ' (Regex)' : '';
+            const caseTitle = (rule.type === 'keyword' && !rule.isRegex) ? (rule.caseSensitive ? ' (Case Sensitive)' : ' (Case Insensitive)') : '';
+            const targetTitle = `Applies to: ${rule.target || 'both'}`;
+            const normTitle = rule.normalize ? ' (Normalized)' : '';
+            // Determine button class based on context (global vs group editor)
+            const removeButtonClass = isGroupRule ? 'racf-remove-group-rule-btn' : 'racf-remove-rule-btn';
+
+            li.innerHTML = `
+                <div class="racf-rule-details">
+                    <span class="racf-rule-type-badge" title="${typeTitle}">${rule.type}</span>
+                    <span class="racf-rule-text">${safeText}</span>
+                    ${rule.isRegex ? `<small title="Regular Expression${caseTitle}">(R${rule.caseSensitive ? '' : 'i'})</small>` : ''}
+                    ${rule.type === 'keyword' && !rule.isRegex && !rule.caseSensitive && !rule.normalize ? '<small title="Case Insensitive">(i)</small>' : ''}
+                    <small title="${targetTitle}">[${rule.target || 'both'}]</small>
+                    ${rule.normalize ? `<small title="${normTitle}">(Norm)</small>` : ''}
+                </div>
+                <div class="racf-rule-actions">
+                   <button class="${removeButtonClass}" data-rule-index="${index}" title="Remove Rule">X</button>
+                </div>`;
+            return li;
+        }
+
+        // --- Group UI Management ---
+        renderGroupList(listElement) {
+            // (No changes from v2.2.0 needed here)
+            listElement.innerHTML = ''; // Clear current list
+            (this.config.filterGroups || []).forEach(group => {
+                const li = document.createElement('li');
+                li.dataset.groupId = group.id;
+                const safeName = this.domPurify.sanitize(group.name || 'Unnamed Group', { USE_PROFILES: { html: false } });
+                li.innerHTML = `
+                    <input type="checkbox" class="racf-group-toggle" ${group.enabled ? 'checked' : ''} title="Enable/Disable this group">
+                    <span class="racf-group-name">${safeName} (${group.rules?.length || 0} rules)</span>
+                    <div class="racf-group-actions">
+                        <button class="racf-edit-group-btn" title="Edit Group">Edit</button>
+                        <button class="racf-delete-group-btn racf-action-btn-negative" title="Delete Group">Delete</button>
+                    </div>
+                `;
+                listElement.appendChild(li);
+            });
+        }
+
+        renderGroupEditor() {
+            // This function populates the editor based on this.editingGroupId and this.groupEditorRules
+            const q = (s) => this.shadowRoot.querySelector(s);
+            const titleEl = q('#racf-group-editor-title');
+            const nameInputEl = q('#racf-group-editor-name');
+            const ruleListEl = q('#racf-group-rule-list');
+            const ruleCountEl = q('#racf-group-editor-rule-count');
+
+            if (!titleEl || !nameInputEl || !ruleListEl || !ruleCountEl) {
+                this.log("Error: Group editor elements not found during render.");
+                return;
+            }
+
+            // --- Populate fields based on state ---
+            if (this.editingGroupId === 'new') {
+                titleEl.textContent = 'Create New Group';
+                nameInputEl.value = '';
+                // this.groupEditorRules should already be empty [] if starting fresh
+            } else {
+                // Find the group being edited (should have been loaded into this.groupEditorRules already by showGroupEditor)
+                const group = (this.config.filterGroups || []).find(g => g.id === this.editingGroupId);
+                 if (group) {
+                    const safeName = this.domPurify.sanitize(group.name || '', { USE_PROFILES: { html: false }});
+                    titleEl.textContent = `Editing Group: ${safeName}`;
+                    nameInputEl.value = group.name || '';
+                    // Note: We don't reload rules from config here. We assume this.groupEditorRules holds the current editing state.
+                } else {
+                     // This case should ideally not happen if showGroupEditor was called correctly
+                     this.log(`Error rendering editor: Group ${this.editingGroupId} not found in config.`);
+                     this.hideGroupEditor(); // Exit editing mode
+                     return;
+                }
+            }
+
+            // --- Render the list of rules currently in the editor's temporary store ---
+            ruleListEl.innerHTML = ''; // Clear previous list items
+            if (!Array.isArray(this.groupEditorRules)) {
+                 this.log("Error: this.groupEditorRules is not an array during render.");
+                 this.groupEditorRules = []; // Reset to empty array
+            }
+            this.groupEditorRules.forEach((rule, index) => {
+                ruleListEl.appendChild(this.createRuleListItem(rule, index, true)); // true = is group rule (for correct remove button class)
+            });
+            ruleCountEl.textContent = this.groupEditorRules.length;
+            this.debugLog(`Rendered group editor with ${this.groupEditorRules.length} rules from temp store.`);
+        }
+
+
+        showGroupEditor(groupId = null) {
+            this.editingGroupId = groupId === null ? 'new' : groupId;
+            this.debugLog(`Showing group editor for: ${this.editingGroupId}`);
+
+            if (this.editingGroupId === 'new') {
+                this.groupEditorRules = []; // Start with empty rules for a new group
+            } else {
+                // Find the existing group and load a *copy* of its rules into the editor state
+                const group = (this.config.filterGroups || []).find(g => g.id === this.editingGroupId);
+                if (group) {
+                    // IMPORTANT: Work on a *deep copy* of the rules, not the original config array
+                    this.groupEditorRules = JSON.parse(JSON.stringify(group.rules || []));
+                } else {
+                    this.log(`Error: Cannot start editing group ${this.editingGroupId}. Not found.`);
+                    this.editingGroupId = null; // Reset state
+                    this.groupEditorRules = [];
+                    alert("Error: Could not find the group to edit.");
+                    return; // Don't proceed to update UI in editor mode
+                }
+            }
+            // Clear the input fields for adding a new rule within the editor
+            this.clearGroupRuleInputs();
+            // Trigger UI update which will show the editor panel and call renderGroupEditor
+            this.updateUI();
+            // Focus the name input after the UI update
+            setTimeout(() => this.shadowRoot.querySelector('#racf-group-editor-name')?.focus(), 0);
+        }
+
+        hideGroupEditor() {
+            this.editingGroupId = null;
+            this.groupEditorRules = []; // Clear temporary rules when hiding
+            this.updateUI(); // Trigger UI update which will hide the editor and show the list
+            this.debugLog("Hid group editor.");
+        }
+
+        clearGroupRuleInputs() {
+            const q = (s) => this.shadowRoot.querySelector(s);
+            const ruleInput = q('#racf-group-rule-input');
+            const typeSelect = q('#racf-group-rule-type');
+            const targetSelect = q('#racf-group-rule-target');
+            const normalizeCheck = q('#racf-group-rule-normalize');
+            if(ruleInput) ruleInput.value = '';
+            if(typeSelect) typeSelect.value = 'keyword';
+            if(targetSelect) targetSelect.value = 'both';
+            if(normalizeCheck) normalizeCheck.checked = false;
+        }
+
+
+        // --- Group Actions ---
+        handleCreateGroup() {
+             this.debugLog("handleCreateGroup called");
+            this.showGroupEditor(); // Show editor in 'new' mode
+        }
+
+        handleEditGroup(groupId) {
+            const group = (this.config.filterGroups || []).find(g => g.id === groupId);
+            if (group) {
+                this.debugLog("handleEditGroup called for:", groupId);
+                this.showGroupEditor(groupId); // Show editor in 'edit' mode for this group
+            } else {
+                this.log(`Cannot edit group ${groupId}: Not found.`);
+            }
+        }
+
+        handleDeleteGroup(groupId) {
+             // (No changes from v2.2.0 needed here)
+            const groupIndex = (this.config.filterGroups || []).findIndex(g => g.id === groupId);
+            if (groupIndex > -1) {
+                 const groupName = this.config.filterGroups[groupIndex].name || 'Unnamed Group';
+                 if (confirm(`Are you sure you want to delete the group "${groupName}" and all its rules?`)) {
+                     this.config.filterGroups.splice(groupIndex, 1);
+                     this.log(`Deleted group: ${groupName} (ID: ${groupId})`);
+                     this.saveConfigAndApplyFilters(); // Save and re-filter
+                     // No need to call updateUI() here, saveConfigAndApplyFilters() implicitly causes UI updates eventually
+                     // If immediate update is desired:
+                     this.updateUI();
+                 }
+            } else {
+                this.log(`Cannot delete group ${groupId}: Not found.`);
+            }
+        }
+
+        handleToggleGroup(groupId, enabled) {
+            // (No changes from v2.2.0 needed here)
+            const group = (this.config.filterGroups || []).find(g => g.id === groupId);
+            if (group) {
+                group.enabled = enabled;
+                this.log(`Group "${group.name}" ${enabled ? 'enabled' : 'disabled'}`);
+                // Save config changes and re-apply filters to reflect the toggle
+                this.saveConfigAndApplyFilters();
+            } else {
+                 this.log(`Cannot toggle group ${groupId}: Not found.`);
+            }
+        }
+
+        // --- Group Editor Actions ---
+        handleAddRuleToGroupEditor() {
+            // This function modifies the temporary this.groupEditorRules array
+            const iE = this.shadowRoot.querySelector('#racf-group-rule-input');
+            const tE = this.shadowRoot.querySelector('#racf-group-rule-type');
+            const tgE = this.shadowRoot.querySelector('#racf-group-rule-target');
+            const nE = this.shadowRoot.querySelector('#racf-group-rule-normalize');
+
+            if (!iE || !tE || !tgE || !nE) { alert("UI error in group editor."); return; }
+            const ruleInputText = iE.value.trim();
+            const ruleType = tE.value;
+            const ruleTarget = tgE.value;
+            const ruleNormalize = nE.checked;
+
+            if (!ruleInputText) { alert("Rule text cannot be empty."); iE.focus(); return; }
+            if (!RULE_TYPES.includes(ruleType)) { alert("Invalid rule type selected."); return; }
+
+            // --- Create Rule Object (Same logic as handleAddRule) ---
+            let text = ruleInputText;
+            let isRegex = false;
+            let caseSensitive = true;
+
+            if (ruleType === 'keyword') {
+                if (text.startsWith('/') && text.length > 2) {
+                    const lastSlashIndex = text.lastIndexOf('/');
+                    if (lastSlashIndex > 0) {
+                        const pattern = text.substring(1, lastSlashIndex);
+                        const flags = text.substring(lastSlashIndex + 1);
+                        try {
+                            new RegExp(pattern, flags); // Validate regex syntax
+                            isRegex = true;
+                            caseSensitive = !flags.includes('i');
+                            // text remains the full /regex/flags string
+                        } catch (e) {
+                            alert(`Invalid Regular Expression: ${e.message}`); return;
+                        }
+                    } else { // Malformed /... pattern
+                        isRegex = false;
+                        caseSensitive = false; // Treat as literal, case-insensitive
+                    }
+                } else { // Plain keyword
+                    isRegex = false;
+                    caseSensitive = false; // Default keyword is case-insensitive
+                }
+            } else if (ruleType === 'user' || ruleType === 'subreddit') {
+                 text = text.replace(/^(u\/|r\/)/i, ''); // Remove prefixes
+                 isRegex = false;
+                 caseSensitive = false; // User/Sub names are case-insensitive on Reddit
+                 text = text.toLowerCase(); // Store lowercase for consistent matching
+            }
+
+            // Normalize implies case-insensitivity for non-regex keywords
+            if (ruleNormalize && ruleType === 'keyword' && !isRegex) {
+                caseSensitive = false;
+            }
+
+            const newRule = {
+                type: ruleType,
+                text: text,
+                isRegex: isRegex,
+                caseSensitive: caseSensitive,
+                target: ruleTarget,
+                normalize: (ruleType === 'keyword' && !isRegex && ruleNormalize) // Normalize flag only for non-regex keywords
+            };
+
+            // --- Check for duplicates *within the editor's current rule list* ---
+             if (!Array.isArray(this.groupEditorRules)) { // Safety check
+                  this.log("Error: groupEditorRules is not an array before adding.");
+                  this.groupEditorRules = [];
+             }
+             const ruleExists = this.groupEditorRules.some(r =>
+                r.type === newRule.type &&
+                r.text === newRule.text &&
+                r.isRegex === newRule.isRegex &&
+                r.caseSensitive === newRule.caseSensitive &&
+                r.target === newRule.target &&
+                r.normalize === newRule.normalize
+            );
+
+            if (ruleExists) {
+                alert("This exact rule already exists in this group.");
+                iE.value = ''; // Clear input even if duplicate found
+                return;
+            }
+
+            // --- Add to temporary array and update UI ---
+            this.groupEditorRules.push(newRule);
+            this.log(`Rule added to editor temp list: ${JSON.stringify(newRule)}`);
+            this.debugLog("Current groupEditorRules:", JSON.stringify(this.groupEditorRules));
+
+            this.clearGroupRuleInputs(); // Clear inputs for next rule
+            iE.focus();
+            this.renderGroupEditor(); // <--- CRITICAL: Re-render the editor UI to show the new rule from the updated array
+        }
+
+        handleRemoveRuleFromGroupEditor(index) {
+            // This modifies the temporary this.groupEditorRules array
+            if (!Array.isArray(this.groupEditorRules)) {
+                 this.log("Error: groupEditorRules is not an array before removing.");
+                 this.groupEditorRules = [];
+                 return;
+            }
+            if (index >= 0 && index < this.groupEditorRules.length) {
+                const removed = this.groupEditorRules.splice(index, 1);
+                this.log(`Rule removed from editor temp list: ${JSON.stringify(removed[0])}`);
+                this.renderGroupEditor(); // Re-render editor list to reflect removal
+            } else {
+                this.log(`Invalid index to remove rule from group editor: ${index}`);
+            }
+        }
+
+        handleSaveGroup() {
+            // This reads from this.groupEditorRules and saves to this.config.filterGroups
+            const nameInputEl = this.shadowRoot.querySelector('#racf-group-editor-name');
+            const groupName = nameInputEl?.value.trim() || 'Unnamed Group';
+
+            if (!Array.isArray(this.groupEditorRules)) { // Safety check
+                 this.log("Error: groupEditorRules is not an array on save.");
+                 alert("An error occurred trying to save the group rules. Please cancel and try again.");
+                 return;
+            }
+
+            if (this.editingGroupId === 'new') {
+                // Create new group using the rules currently in the editor
+                const newGroup = {
+                    id: generateGroupId(),
+                    name: groupName,
+                    enabled: true, // Enable new groups by default
+                    rules: this.groupEditorRules // Assign the collected rules
+                };
+                if (!this.config.filterGroups) this.config.filterGroups = [];
+                this.config.filterGroups.push(newGroup);
+                this.log(`Created new group: ${groupName} (ID: ${newGroup.id}) with ${newGroup.rules.length} rules.`);
+            } else {
+                // Update existing group
+                const groupIndex = (this.config.filterGroups || []).findIndex(g => g.id === this.editingGroupId);
+                if (groupIndex > -1) {
+                    this.config.filterGroups[groupIndex].name = groupName;
+                    // Replace the existing rules with the rules currently in the editor
+                    this.config.filterGroups[groupIndex].rules = this.groupEditorRules;
+                     this.log(`Updated group: ${groupName} (ID: ${this.editingGroupId}) with ${this.groupEditorRules.length} rules.`);
+                } else {
+                     this.log(`Error saving group: Cannot find group with ID ${this.editingGroupId}`);
+                     alert("Error: Could not find the group to save changes. The group may have been deleted.");
+                     this.hideGroupEditor(); // Exit editor mode
+                     return;
+                }
+            }
+
+            // Save the updated config and re-apply filters
+            this.saveConfigAndApplyFilters();
+            // Hide the editor and let the main UI update cycle refresh the group list
+            this.hideGroupEditor();
+        }
+
+        handleCancelGroup() {
+            // (No changes from v2.2.0 needed here)
+             this.debugLog("handleCancelGroup called - discarding editor changes");
+            this.hideGroupEditor(); // Just close the editor, discard changes in this.groupEditorRules
+        }
+
+        // --- Global Rule Management ---
+        handleAddRule() {
+            // (No changes from v2.2.0 needed here - only adds global rules)
+            const iE=this.shadowRoot.querySelector('#racf-rule-input'); const tE=this.shadowRoot.querySelector('#racf-rule-type'); const tgE=this.shadowRoot.querySelector('#racf-rule-target'); const nE=this.shadowRoot.querySelector('#racf-rule-normalize');
+            if(!iE||!tE||!tgE||!nE){alert("UI error in global settings.");return;}
+            const rIT=iE.value.trim(); const rT=tE.value; const rTg=tgE.value; const rN=nE.checked;
+            if(!rIT){alert("Rule text cannot be empty.");iE.focus();return;}
+            if(!RULE_TYPES.includes(rT)){alert("Invalid rule type selected.");return;}
+
+            let txt=rIT; let isR=false; let cS=true;
+            if(rT==='keyword'){
+                if(txt.startsWith('/') && txt.length > 2){
+                    const lSI = txt.lastIndexOf('/');
+                    if(lSI > 0){
+                        const p=txt.substring(1,lSI); const f=txt.substring(lSI+1);
+                        try{ new RegExp(p,f); isR=true; cS=!f.includes('i'); /*txt=txt;*/ } // Keep full /regex/flags
+                        catch(e){ alert(`Invalid Regex: ${e.message}`); return; }
+                    } else { isR=false; cS=false; } // Treat as literal if malformed regex-like
+                } else { isR=false; cS=false; } // Plain keyword
+            } else if(rT==='user'||rT==='subreddit'){
+                txt=txt.replace(/^(u\/|r\/)/i,''); isR=false; cS=false; txt=txt.toLowerCase();
+            }
+
+            if(rN && rT==='keyword' && !isR){ cS = false; } // Normalize implies case-insensitive
+
+            const nR = { type:rT, text:txt, isRegex:isR, caseSensitive:cS, target:rTg, normalize:(rT==='keyword'&&!isR&&rN) };
+
+            if(!this.config.rules) this.config.rules=[];
+            const rE = this.config.rules.some(r=>r.type===nR.type && r.text===nR.text && r.isRegex===nR.isRegex && r.caseSensitive===nR.caseSensitive && r.target===nR.target && r.normalize===nR.normalize);
+            if(rE){ alert("This exact global rule already exists."); iE.value=''; return; }
+
+            this.config.rules.push(nR);
+            this.log(`Global rule added: ${JSON.stringify(nR)}`);
+            iE.value=''; nE.checked=false; tgE.value='both'; tE.value='keyword'; iE.focus();
+            this.saveConfigAndApplyFilters(); // Save and re-apply
+            this.updateUI(); // Update global rule list display
+        }
+
+        removeRuleByIndex(index) {
+            // (No changes from v2.2.0 needed here - only removes global rules)
+            if(!this.config.rules || index < 0 || index >= this.config.rules.length){
+                this.log(`Cannot remove global rule: Bad index ${index}`);
+                return;
+            }
+            const rm = this.config.rules.splice(index, 1);
+            this.log(`Global rule removed: ${JSON.stringify(rm[0])}`);
+            this.saveConfigAndApplyFilters(); // Save and re-apply
+            this.updateUI(); // Update global rule list display
+        }
+
+        handleFilterTypeChange(event) {
+            // (No changes from v2.1.1 needed here)
+            const { value, checked } = event.target;
+            if (!this.config.filterTypes) this.config.filterTypes = [];
+            const index = this.config.filterTypes.indexOf(value);
+            if (checked && index === -1) {
+                this.config.filterTypes.push(value);
+            } else if (!checked && index > -1) {
+                this.config.filterTypes.splice(index, 1);
+            }
+            this.saveConfigAndApplyFilters(); // Re-filtering needed
+        }
+
+        // --- Core Filtering Logic ---
+        initializeObserver() {
+            // (No changes from v2.1.1 needed here)
+            if (!window.MutationObserver) { this.log("MutationObserver not available."); return; }
+            if (this.observer) { this.observer.disconnect(); } // Disconnect previous if any
+            this.observer = new MutationObserver(this.mutationCallback.bind(this));
+            this.observer.observe(document.body, { childList: true, subtree: true });
+            this.log("Mutation observer initialized.");
+        }
+
+        mutationCallback(mutationsList) {
+            // (No changes from v2.1.1 needed here)
+            const nodesToConsider = new Set();
+            let hasRelevantChanges = false;
+
+            for (const mutation of mutationsList) {
+                if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
+                    mutation.addedNodes.forEach(node => {
+                        if (node.nodeType === Node.ELEMENT_NODE &&
+                            !node.id?.startsWith(SCRIPT_PREFIX) && // Ignore our UI
+                            !node.closest(`#${SCRIPT_PREFIX}-ui-container`))
+                        {
+                            // Check if the node itself is a post/comment
+                            if (node.matches && (node.matches(this.selectors.post) || node.matches(this.selectors.comment))) {
+                                nodesToConsider.add(node);
+                                hasRelevantChanges = true;
+                            }
+                            // Check if the node contains posts/comments
+                            if (node.querySelectorAll) {
+                                try {
+                                    node.querySelectorAll(`${this.selectors.post}, ${this.selectors.comment}`).forEach(element => {
+                                        nodesToConsider.add(element);
+                                        hasRelevantChanges = true;
+                                    });
+                                } catch (e) {
+                                    this.debugLog(`Error querying added node children: ${e.message}`, node);
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+
+            if (hasRelevantChanges && nodesToConsider.size > 0) {
+                this.debugLog(`Mutation detected ${nodesToConsider.size} potentially new nodes.`);
+                this.applyFilters(Array.from(nodesToConsider)); // Filter only the potentially new nodes
+            }
+        }
+
+        applyFilters(nodesOrRoot) {
+             // (No changes from v2.1.1 needed here, logic is in shouldFilterNode)
+            let itemsToProcess = [];
+            const startTime = performance.now();
+            const elementsSet = new Set();
+
+            const collectElements = (rootElement) => {
+                if (!rootElement || rootElement.nodeType !== Node.ELEMENT_NODE) return;
+                try {
+                    // Check the root element itself
+                    if (rootElement.matches && (rootElement.matches(this.selectors.post) || rootElement.matches(this.selectors.comment))) {
+                         if (!this.processedNodes.has(rootElement)) { // Check if already processed
+                            elementsSet.add(rootElement);
+                        }
+                    }
+                    // Query children
+                    rootElement.querySelectorAll(`${this.selectors.post}, ${this.selectors.comment}`).forEach(el => {
+                        if (!this.processedNodes.has(el)) { // Check if already processed
+                            elementsSet.add(el);
+                        }
+                    });
+                } catch (e) {
+                    this.log(`Error collecting elements: ${e.message}`);
+                    console.error("Collect Error Node:", rootElement, e);
+                }
+            };
+
+            if (Array.isArray(nodesOrRoot)) {
+                nodesOrRoot.forEach(node => collectElements(node));
+            } else if (nodesOrRoot?.nodeType === Node.ELEMENT_NODE) {
+                collectElements(nodesOrRoot);
+            } else {
+                this.debugLog("Invalid input for applyFilters:", nodesOrRoot);
+                return; // Nothing to process
+            }
+
+            itemsToProcess = Array.from(elementsSet);
+
+            if (itemsToProcess.length === 0) {
+                // this.debugLog("No new nodes found to filter.");
+                return; // Nothing new to process
+            }
+
+            this.debugLog(`Filtering ${itemsToProcess.length} new nodes...`);
+            let statsChanged = false;
+            let processedCount = 0;
+            let filteredCount = 0;
+            let whitelistedCount = 0;
+
+            itemsToProcess.forEach(node => {
+                this.processedNodes.add(node); // Mark as processed *before* filtering
+                processedCount++;
+                statsChanged = true; // Assume stats will change if we process anything
+
+                try {
+                    const filterResult = this.shouldFilterNode(node); // <= CORE LOGIC HERE
+
+                    if (filterResult.whitelisted) {
+                        whitelistedCount++;
+                        this.unfilterNode(node); // Ensure any previous filter class is removed
+                        this.debugLog(`Whitelisted: ${filterResult.reason}`, node);
+                    } else if (filterResult.filter) {
+                        filteredCount++;
+                        const nodeType = filterResult.nodeType;
+                        const effectiveAction = this.getEffectiveAction(this.config.filterAction, nodeType);
+
+                        // Update stats
+                        if (nodeType && this.stats.filteredByType) {
+                           this.stats.filteredByType[nodeType] = (this.stats.filteredByType[nodeType] || 0) + 1;
+                        }
+                        if (effectiveAction && this.stats.filteredByAction) {
+                            this.stats.filteredByAction[effectiveAction] = (this.stats.filteredByAction[effectiveAction] || 0) + 1;
+                        }
+                        // Use the detailed rule text (includes group info) for stats
+                        const ruleStatText = filterResult.ruleText || `type:${filterResult.reason}`;
+                        if (ruleStatText && this.stats.filteredByRule) {
+                           this.stats.filteredByRule[ruleStatText] = (this.stats.filteredByRule[ruleStatText] || 0) + 1;
+                        }
+
+                        this.filterNode(node, filterResult.reason, nodeType, effectiveAction); // Apply the filter effect
+                        this.debugLog(`Filtered (${effectiveAction}): ${filterResult.reason}`, node);
+                    } else {
+                        // Not filtered, ensure it's clean
+                        this.unfilterNode(node);
+                        this.debugLog(`Not filtered: ${filterResult.reason}`, node);
+                    }
+                } catch (err) {
+                    this.log(`Error filtering node: ${err.message}`);
+                    console.error(`Filter Node Error:`, err, node);
+                    try { this.unfilterNode(node); } catch {} // Attempt to unfilter on error
+                }
+            });
+
+            if (statsChanged) {
+                this.stats.totalProcessed += processedCount;
+                this.stats.totalFiltered += filteredCount;
+                this.stats.totalWhitelisted += whitelistedCount;
+                this.debouncedSaveStats(); // Save stats (debounced)
+
+                // Debounce UI update for performance
+                if (this.uiUpdateDebounceTimer) clearTimeout(this.uiUpdateDebounceTimer);
+                this.uiUpdateDebounceTimer = setTimeout(() => {
+                    if (this.config.uiVisible && (this.config.activeTab === 'stats' || this.config.activeTab === 'groups')) {
+                        this.updateUI(); // Update UI only if visible and relevant tab active
+                    }
+                    this.uiUpdateDebounceTimer = null;
+                }, 300); // Slightly longer delay for UI update after filtering
+            }
+
+            this.lastFilterTime = performance.now();
+            const duration = this.lastFilterTime - startTime;
+            if (itemsToProcess.length > 0) {
+                 this.debugLog(`Filtering ${itemsToProcess.length} nodes took ${duration.toFixed(2)} ms.`);
+            }
+        }
+
+        getEffectiveAction(chosenAction, nodeType) {
+            // (No changes from v2.2.0 needed here)
+             if (nodeType !== 'comments') {
+                if (chosenAction === 'collapse' || chosenAction === 'replace_text') {
+                    return 'hide'; // Fallback for non-comments
+                }
+            }
+            return chosenAction;
+        }
+
+        shouldFilterNode(node) {
+            // (No changes from v2.2.0 needed here)
+            let nodeType = null;
+            if (node.matches(this.selectors.post)) nodeType = 'posts';
+            else if (node.matches(this.selectors.comment)) nodeType = 'comments';
+            else return { filter: false, reason: "Not a target node type", whitelisted: false, ruleText: null, nodeType: null };
+
+            let result = { filter: false, reason: "Initial", whitelisted: false, ruleText: null, nodeType: nodeType };
+
+            // 1. Check if filter type (post/comment) is enabled
+            if (!(this.config.filterTypes || []).includes(nodeType)) {
+                result.reason = `Filtering for type '${nodeType}' is disabled`;
+                return result;
+            }
+
+            // 2. Extract metadata (only once per node)
+            const subreddit = this.extractSubreddit(node, nodeType)?.toLowerCase() ?? null;
+            const author = this.extractAuthor(node, nodeType)?.toLowerCase() ?? null;
+
+            // 3. Check Blacklists (override everything except explicit whitelist)
+            if (subreddit && (this.config.blacklist?.subreddits || []).includes(subreddit)) {
+                return { ...result, filter: true, reason: `Blacklisted Subreddit: r/${subreddit}`, ruleText: `[BLACKLIST] Sub: r/${subreddit}` };
+            }
+            if (author && (this.config.blacklist?.users || []).includes(author)) {
+                return { ...result, filter: true, reason: `Blacklisted User: u/${author}`, ruleText: `[BLACKLIST] User: u/${author}` };
+            }
+
+            // 4. Check Whitelists (override blacklist and rules)
+            if (subreddit && (this.config.whitelist?.subreddits || []).includes(subreddit)) {
+                return { ...result, whitelisted: true, reason: `Whitelisted Subreddit: r/${subreddit}` };
+            }
+            if (author && (this.config.whitelist?.users || []).includes(author)) {
+                return { ...result, whitelisted: true, reason: `Whitelisted User: u/${author}` };
+            }
+
+            // 5. Check Rules (Global first, then Enabled Groups)
+            let contentCache = { title: null, body: null, checked: false }; // Cache extracted content
+
+            // --- 5a. Check Global Rules ---
+            for (const rule of (this.config.rules || [])) {
+                const matchResult = this.checkRuleMatch(node, nodeType, rule, contentCache, author, subreddit);
+                if (matchResult.match) {
+                    const ruleStatText = this.formatRuleStatText(rule, 'GLOBAL');
+                    return { ...result, filter: true, reason: `Global Rule: ${matchResult.reasonDetail}`, ruleText: ruleStatText };
+                }
+                 // Update contentCache if extraction happened
+                 if(matchResult.contentChecked) contentCache.checked = true;
+                 if(matchResult.extractedTitle !== undefined) contentCache.title = matchResult.extractedTitle;
+                 if(matchResult.extractedBody !== undefined) contentCache.body = matchResult.extractedBody;
+            }
+
+            // --- 5b. Check Enabled Group Rules ---
+            for (const group of (this.config.filterGroups || [])) {
+                if (group.enabled) {
+                    for (const rule of (group.rules || [])) {
+                        const matchResult = this.checkRuleMatch(node, nodeType, rule, contentCache, author, subreddit);
+                         if (matchResult.match) {
+                             const groupName = group.name || 'Unnamed Group';
+                             const ruleStatText = this.formatRuleStatText(rule, `GROUP: ${groupName}`);
+                            return { ...result, filter: true, reason: `Group Rule (${groupName}): ${matchResult.reasonDetail}`, ruleText: ruleStatText };
+                        }
+                        // Update contentCache if extraction happened
+                        if(matchResult.contentChecked) contentCache.checked = true;
+                        if(matchResult.extractedTitle !== undefined) contentCache.title = matchResult.extractedTitle;
+                        if(matchResult.extractedBody !== undefined) contentCache.body = matchResult.extractedBody;
+                    }
+                }
+            }
+
+            // 6. If no blacklist, whitelist, or rule matched
+            result.reason = "No matching filters";
+            return result;
+        }
+
+        checkRuleMatch(node, nodeType, rule, contentCache, author, subreddit) {
+            // (No changes from v2.2.0 needed here)
+            let match = false;
+            let reasonDetail = "";
+            let contentChecked = contentCache.checked;
+            let extractedTitle = contentCache.title;
+            let extractedBody = contentCache.body;
+
+            try {
+                switch (rule.type) {
+                    case 'keyword':
+                        const target = rule.target || 'both';
+                        // Extract content only if needed and not already cached
+                        if (!contentCache.checked) {
+                            const extracted = this.extractContent(node, nodeType);
+                            extractedTitle = extracted.title;
+                            extractedBody = extracted.body;
+                            contentChecked = true; // Mark as checked now
+                            this.debugLog(`Extracted Content - Title: ${!!extractedTitle}, Body: ${!!extractedBody}`, node);
+                        }
+
+                        let contentToTest = [];
+                        let targetsApplied = [];
+                        if ((target === 'title' || target === 'both') && extractedTitle) {
+                            contentToTest.push(extractedTitle);
+                            targetsApplied.push('title');
+                        }
+                        if ((target === 'body' || target === 'both') && extractedBody) {
+                            contentToTest.push(extractedBody);
+                            targetsApplied.push('body');
+                        }
+
+                        if (contentToTest.length === 0) {
+                            this.debugLog(`Skipping rule '${rule.text}': No content found for target '${target}'`, node);
+                            break; // No content to test against
+                        }
+
+                        reasonDetail = `[${rule.type}] '${this.domPurify.sanitize(rule.text)}'`;
+                        let testFunction;
+                        let ruleDesc = "";
+
+                        if (rule.isRegex) {
+                             // Safely parse regex string like /pattern/flags
+                             const regexMatch = rule.text.match(/^\/(.+)\/([gimyus]*)$/);
+                             if (regexMatch) {
+                                try {
+                                    const regex = new RegExp(regexMatch[1], regexMatch[2]);
+                                    testFunction = (text) => regex.test(text);
+                                    ruleDesc = ` (Regex${regex.flags.includes('i') ? ', Insensitive' : ''})`;
+                                } catch (regexError) {
+                                    this.log(`Rule error (invalid regex) '${rule.text}': ${regexError.message}`);
+                                    break; // Skip this invalid rule
+                                }
+                            } else {
+                                 this.log(`Rule error (malformed regex) '${rule.text}'`);
+                                 break; // Skip malformed regex rule
+                            }
+                        } else {
+                            // Plain keyword
+                            const useNormalize = rule.normalize;
+                            const isCaseSensitive = rule.caseSensitive; // Should be false if normalized
+                            const comparisonPattern = useNormalize ? this.normalizeText(rule.text) : (isCaseSensitive ? rule.text : rule.text.toLowerCase());
+
+                            testFunction = (textContent) => {
+                                if (!textContent) return false;
+                                const comparisonContent = useNormalize ? this.normalizeText(textContent) : (isCaseSensitive ? textContent : textContent.toLowerCase());
+                                return comparisonContent.includes(comparisonPattern);
+                            };
+                            ruleDesc = `${useNormalize ? ' (Normalized)' : (isCaseSensitive ? ' (Case Sensitive)' : ' (Case Insensitive)')}`;
+                        }
+
+                         match = contentToTest.some(text => testFunction(text));
+                         if (match) {
+                             reasonDetail += `${ruleDesc} matched in ${targetsApplied.join(' & ')}`;
+                         }
+                        break;
+
+                    case 'user':
+                        if (!author) break; // No author extracted
+                        match = (author === rule.text); // rule.text should be lowercase from input
+                        if (match) {
+                            reasonDetail = `[${rule.type}] matched author 'u/${author}'`;
+                        }
+                        break;
+
+                    case 'subreddit':
+                        if (!subreddit || nodeType !== 'posts') break; // No sub or not a post
+                        match = (subreddit === rule.text); // rule.text should be lowercase
+                        if (match) {
+                             reasonDetail = `[${rule.type}] matched subreddit 'r/${subreddit}'`;
+                        }
+                        break;
+                }
+            } catch (e) {
+                this.log(`Error processing rule [${rule.type}] '${rule.text}': ${e.message}`);
+                console.error(`Rule Processing Error:`, e, rule, node);
+            }
+
+            return { match, reasonDetail, contentChecked, extractedTitle, extractedBody };
+        }
+
+        formatRuleStatText(rule, context = 'GLOBAL') {
+            // (No changes from v2.2.0 needed here)
+            const type = rule.type;
+            const isRegex = rule.isRegex ? '(R)' : '';
+            const isNorm = rule.normalize ? '(N)' : '';
+            const target = rule.target ? `-${rule.target}` : '';
+            const safeText = this.domPurify.sanitize(rule.text.substring(0, 50) + (rule.text.length > 50 ? '...' : ''), { USE_PROFILES: { html: false }}); // Truncate long rules
+            return `[${context}] [${type}${isRegex}${isNorm}${target}] ${safeText}`;
+        }
+
+
+        // --- Content Extraction (Mostly unchanged from v2.1.1) ---
+        normalizeText(text) {
+            // (No changes from v2.2.0 needed here)
+            if (typeof text !== 'string') return '';
+            try {
+                 // NFD: Canonical Decomposition (e.g., é -> e + ´)
+                 // Remove combining diacritical marks (U+0300 to U+036F)
+                 return text.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+            } catch (e) {
+                 this.log(`Error normalizing text: ${e.message}. Falling back to simple lowercasing.`);
+                 return text.toLowerCase();
+            }
+        }
+
+        extractContent(node, nodeType) {
+            // (No significant changes from v2.1.1 needed here)
+            const result = { title: null, body: null };
+            try {
+                // Title extraction (only for posts)
+                if (nodeType === 'posts' && this.selectors.postTitleSelector) {
+                    const titleElement = node.querySelector(this.selectors.postTitleSelector);
+                    if (titleElement) {
+                        result.title = titleElement.textContent?.trim() || null;
+                         // Simple whitespace normalization for comparison
+                        if (result.title) result.title = result.title.replace(/\s+/g, ' ');
+                    }
+                }
+
+                // Body extraction (posts and comments)
+                let bodySelector = null;
+                if (nodeType === 'posts' && this.selectors.postBodySelector) {
+                    bodySelector = this.selectors.postBodySelector;
+                } else if (nodeType === 'comments' && this.selectors.commentBodySelector) {
+                    bodySelector = this.selectors.commentBodySelector;
+                }
+
+                if (bodySelector) {
+                    const bodyElement = node.querySelector(bodySelector);
+                    if (bodyElement) {
+                        result.body = bodyElement.textContent?.trim() || null;
+                         // Simple whitespace normalization
+                        if (result.body) result.body = result.body.replace(/\s+/g, ' ');
+                    } else if (this.isOldReddit && nodeType === 'posts') {
+                        // Fallback for old Reddit expanded post bodies
+                        const oldPostBody = node.querySelector('.expando .usertext-body .md');
+                        if (oldPostBody) {
+                             result.body = oldPostBody.textContent?.trim() || null;
+                             if (result.body) result.body = result.body.replace(/\s+/g, ' ');
+                        }
+                    }
+                }
+            } catch (e) {
+                 this.log(`Error extracting content (type: ${nodeType}): ${e.message}`);
+                 console.error("Content Extraction Error:", node, e);
+            }
+             // this.debugLog(`Extraction result - Title: ${!!result.title}, Body: ${!!result.body}`, node);
+            return result;
+        }
+
+        extractSubreddit(node, nodeType) {
+             // (No changes from v2.1.1 needed here)
+            if (nodeType !== 'posts' || !this.selectors.postSubredditSelector) return null;
+            try {
+                const subElement = node.querySelector(this.selectors.postSubredditSelector);
+                if (subElement) {
+                    // Extract text and remove 'r/' prefix if present
+                    return subElement.textContent?.trim().replace(/^r\//i, '') || null;
+                }
+                // Fallback for some new Reddit structures might be needed if the primary selector fails
+                if (!this.isOldReddit) {
+                     const linkSub = node.querySelector('a[data-testid="subreddit-name"]'); // Example specific test ID
+                     if (linkSub) return linkSub.textContent?.trim().replace(/^r\//i, '') || null;
+                }
+                return null;
+            } catch (e) {
+                this.log(`Error extracting subreddit: ${e.message}`);
+                return null;
+            }
+        }
+
+        extractAuthor(node, nodeType) {
+            // (No changes from v2.1.1 needed here)
+            const selector = nodeType === 'posts' ? this.selectors.postAuthorSelector : this.selectors.commentAuthorSelector;
+            if (!selector) return null;
+
+            try {
+                const authorElement = node.querySelector(selector);
+                if (authorElement) {
+                    const authorText = authorElement.textContent?.trim();
+                    // Check for valid author name (not deleted/removed)
+                    if (authorText && !['[deleted]', '[removed]', ''].includes(authorText.toLowerCase())) {
+                        return authorText.replace(/^u\//i, '') || null; // Remove u/ prefix
+                    }
+                }
+                 // Fallback for new Reddit if primary selector fails
+                 if (!this.isOldReddit) {
+                     const linkAuthor = node.querySelector('a[data-testid="post-author-link"], a[data-testid="comment-author-link"]');
+                     if (linkAuthor) {
+                         const authorText = linkAuthor.textContent?.trim();
+                         if (authorText && !['[deleted]', '[removed]', ''].includes(authorText.toLowerCase())) {
+                             return authorText.replace(/^u\//i, '') || null;
+                         }
+                     }
+                 }
+                return null;
+            } catch (e) {
+                this.log(`Error extracting author (type: ${nodeType}): ${e.message}`);
+                return null;
+            }
+        }
+
+
+        // --- Applying/Removing Filter Effects ---
+        filterNode(node, reason, nodeType, action) {
+            // (No changes from v2.2.0 needed here)
+            this.unfilterNode(node); // Clean slate first
+
+            const effectiveAction = this.getEffectiveAction(action, nodeType); // Re-check action validity
+            const shortReason = reason.substring(0, 200) + (reason.length > 200 ? '...' : ''); // Tooltip reason
+            const filterAttributeValue = `${SCRIPT_PREFIX}: Filtered [${effectiveAction}] (${shortReason})`;
+
+            if (effectiveAction === 'replace_text' && nodeType === 'comments') {
+                 this.replaceCommentText(node, shortReason); // Handle text replacement
+                 node.setAttribute('data-racf-filter-reason', filterAttributeValue);
+                 node.title = filterAttributeValue; // Add tooltip
+            } else if (FILTER_ACTIONS.includes(effectiveAction) && effectiveAction !== 'replace_text') {
+                 const actionClass = `${SCRIPT_PREFIX}-${effectiveAction}`;
+                 node.classList.add(actionClass);
+                 node.setAttribute('data-racf-filter-reason', filterAttributeValue);
+                 node.title = filterAttributeValue; // Add tooltip
+                 this.debugLog(`Applied class '${actionClass}' to:`, node);
+            } else {
+                 // Fallback or invalid action - default to hide
+                 this.log(`Invalid or incompatible action '${action}' for node type '${nodeType}'. Falling back to 'hide'.`);
+                 node.classList.add(`${SCRIPT_PREFIX}-hide`);
+                 const fallbackAttributeValue = `${SCRIPT_PREFIX}: Filtered [hide - fallback] (${shortReason})`;
+                 node.setAttribute('data-racf-filter-reason', fallbackAttributeValue);
+                 node.title = fallbackAttributeValue;
+            }
+        }
+
+        replaceCommentText(commentNode, reason) {
+             // (No changes from v2.1.1 needed here)
+            const bodySelector = this.selectors.commentBodySelector;
+            if (!bodySelector) { this.log("Cannot replace text: commentBodySelector is not defined."); return; }
+
+            const commentBody = commentNode.querySelector(bodySelector);
+            if (!commentBody) { this.debugLog("Cannot replace text: Comment body element not found using selector:", bodySelector, "on node:", commentNode); return; }
+
+            // Cache original content ONLY if it's not already replaced
+            if (!this.originalContentCache.has(commentBody)) {
+                const currentHTML = commentBody.innerHTML;
+                // Check if the placeholder text is already present
+                if (!currentHTML || !currentHTML.includes(`[${SCRIPT_PREFIX}: Text Filtered`)) {
+                    this.originalContentCache.set(commentBody, currentHTML);
+                    this.debugLog("Stored original comment HTML for restoration:", commentBody);
+                } else {
+                    this.debugLog("Skipping original content cache: Placeholder already present.", commentBody);
+                }
+            } else {
+                 // Already cached, no need to re-cache
+                 // this.debugLog("Original content already cached for:", commentBody);
+            }
+
+
+            const placeholderHTML = `<p>[${SCRIPT_PREFIX}: Text Filtered (${reason})]</p>`;
+            // Replace content only if it's different from the placeholder
+            if (commentBody.innerHTML !== placeholderHTML) {
+                commentBody.innerHTML = placeholderHTML;
+                commentNode.classList.add(`${SCRIPT_PREFIX}-text-replaced`); // Add class to indicate replacement
+                this.debugLog("Replaced comment text:", commentNode);
+            } else {
+                 // Already replaced, do nothing
+                 // this.debugLog("Comment text already replaced.", commentNode);
+            }
+        }
+
+        unfilterNode(node) {
+             // (No changes from v2.1.1 needed here)
+            let wasModified = false;
+
+            // Remove action classes
+            FILTER_ACTIONS.forEach(action => {
+                 if (action !== 'replace_text') { // Text replacement handled separately
+                    const className = `${SCRIPT_PREFIX}-${action}`;
+                    if (node.classList.contains(className)) {
+                        node.classList.remove(className);
+                        wasModified = true;
+                    }
+                 }
+            });
+
+            // Handle text replacement restoration
+            const textReplacedClass = `${SCRIPT_PREFIX}-text-replaced`;
+            if (node.classList.contains(textReplacedClass)) {
+                node.classList.remove(textReplacedClass);
+                wasModified = true;
+
+                const bodySelector = this.selectors.commentBodySelector;
+                const commentBody = bodySelector ? node.querySelector(bodySelector) : null;
+
+                if (commentBody && this.originalContentCache.has(commentBody)) {
+                    const originalHTML = this.originalContentCache.get(commentBody);
+                     // Only restore if current content looks like the placeholder
+                     if (commentBody.innerHTML && commentBody.innerHTML.includes(`[${SCRIPT_PREFIX}: Text Filtered`)) {
+                         commentBody.innerHTML = originalHTML;
+                         this.debugLog("Restored original comment text:", node);
+                     } else {
+                         this.debugLog("Skipping text restore: Current content doesn't look like placeholder.", commentBody);
+                     }
+                    this.originalContentCache.delete(commentBody); // Clean up cache entry after restore
+                } else if (commentBody) {
+                     // Attempt cleanup even if cache missed - if it looks replaced, clear it.
+                     if (commentBody.innerHTML && commentBody.innerHTML.includes(`[${SCRIPT_PREFIX}: Text Filtered`)) {
+                        commentBody.innerHTML = `<!-- [${SCRIPT_PREFIX}] Original content missing, cache empty. -->`;
+                        this.debugLog("Could not restore text (cache miss), cleared placeholder.", node);
+                     }
+                }
+            }
+
+             // Remove data attribute and title
+             if (node.hasAttribute('data-racf-filter-reason')) {
+                 node.removeAttribute('data-racf-filter-reason');
+                 wasModified = true;
+             }
+             if (node.title?.startsWith(SCRIPT_PREFIX + ':')) {
+                 node.removeAttribute('title');
+                 wasModified = true;
+             }
+
+             if (wasModified) {
+                 this.debugLog("Unfiltered node:", node);
+             }
+        }
+
+        // --- Import/Export ---
+        exportConfig() {
+             // (No changes from v2.2.0 needed here)
+             try {
+                // Create a clean config object based on current state + defaults
+                const configToExport = {
+                    ...DEFAULT_CONFIG, // Start with defaults
+                    rules: Array.isArray(this.config.rules) ? this.config.rules : [],
+                    filterGroups: Array.isArray(this.config.filterGroups) ? this.config.filterGroups : [],
+                    filterTypes: Array.isArray(this.config.filterTypes) ? this.config.filterTypes : DEFAULT_CONFIG.filterTypes,
+                    filterAction: FILTER_ACTIONS.includes(this.config.filterAction) ? this.config.filterAction : DEFAULT_CONFIG.filterAction,
+                    whitelist: {
+                         subreddits: Array.isArray(this.config.whitelist?.subreddits) ? this.config.whitelist.subreddits : [],
+                         users: Array.isArray(this.config.whitelist?.users) ? this.config.whitelist.users : []
+                     },
+                    blacklist: {
+                        subreddits: Array.isArray(this.config.blacklist?.subreddits) ? this.config.blacklist.subreddits : [],
+                        users: Array.isArray(this.config.blacklist?.users) ? this.config.blacklist.users : []
+                    },
+                    uiPosition: { ...DEFAULT_CONFIG.uiPosition, ...(this.config.uiPosition || {}) },
+                    uiVisible: typeof this.config.uiVisible === 'boolean' ? this.config.uiVisible : DEFAULT_CONFIG.uiVisible,
+                    activeTab: typeof this.config.activeTab === 'string' ? this.config.activeTab : DEFAULT_CONFIG.activeTab,
+                };
+
+                // Basic validation/cleanup before stringifying (optional but good practice)
+                configToExport.filterGroups.forEach(g => {
+                    if (!g.id) g.id = generateGroupId(); // Ensure IDs exist
+                    g.rules = Array.isArray(g.rules) ? g.rules : []; // Ensure rules array exists
+                });
+
+                const configString = JSON.stringify(configToExport, null, 2); // Pretty print
+                const blob = new Blob([configString], { type: 'application/json;charset=utf-8' });
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.setAttribute('href', url);
+                const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+                link.setAttribute('download', `reddit-filter-config-${timestamp}.json`);
+                link.style.display = 'none';
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                URL.revokeObjectURL(url);
+                this.log("Configuration exported successfully.");
+            } catch (e) {
+                this.log(`Export error: ${e.message}`);
+                alert(`Export failed: ${e.message}`);
+                console.error("Export Error:", e);
+            }
+        }
+
+        async importConfig(event) {
+             // (No changes from v2.2.0 needed here)
+             const fileInput = event.target;
+             const file = fileInput?.files?.[0];
+             if (!file) { this.log("Import cancelled."); return; }
+             if (!file.type || !file.type.match('application/json')) {
+                 alert('Import failed: Invalid file type. Please select a .json file.');
+                 if (fileInput) fileInput.value = null; // Reset file input
+                 return;
+             }
+
+             const reader = new FileReader();
+             reader.onload = async (e) => {
+                 const content = e.target?.result;
+                 if (!content || typeof content !== 'string') { alert("Import failed: File is empty or unreadable."); return; }
+
+                 try {
+                     const importedConfig = JSON.parse(content);
+                     if (typeof importedConfig !== 'object' || importedConfig === null) {
+                         throw new Error("Invalid JSON format. The file does not contain a valid configuration object.");
+                     }
+
+                     // --- Validate and Merge Imported Config ---
+                     const newConfig = JSON.parse(JSON.stringify(DEFAULT_CONFIG)); // Start fresh
+
+                     // Rules (Global)
+                     if (Array.isArray(importedConfig.rules)) {
+                         newConfig.rules = importedConfig.rules.filter(rule => this.isValidRule(rule)).map(rule => this.sanitizeRule(rule));
+                     }
+
+                     // Filter Groups
+                     if (Array.isArray(importedConfig.filterGroups)) {
+                          newConfig.filterGroups = importedConfig.filterGroups
+                            .filter(group => group && typeof group === 'object' && typeof group.name === 'string' && typeof group.enabled === 'boolean' && Array.isArray(group.rules))
+                            .map(group => ({
+                                id: group.id || generateGroupId(), // Assign new ID if missing
+                                name: group.name,
+                                enabled: group.enabled,
+                                rules: group.rules.filter(rule => this.isValidRule(rule)).map(rule => this.sanitizeRule(rule))
+                            }));
+                     }
+
+                     // Filter Types
+                     if (Array.isArray(importedConfig.filterTypes)) {
+                         newConfig.filterTypes = importedConfig.filterTypes.filter(type => ['posts', 'comments', 'messages'].includes(type)); // Allow 'messages' even if unused?
+                     }
+
+                     // Filter Action
+                     if (FILTER_ACTIONS.includes(importedConfig.filterAction)) {
+                         newConfig.filterAction = importedConfig.filterAction;
+                     }
+
+                     // Whitelists/Blacklists
+                     const sanitizeStringArray = (arr) => Array.isArray(arr) ? arr.map(s => String(s).toLowerCase().trim()).filter(Boolean) : [];
+                     if (importedConfig.whitelist) {
+                         newConfig.whitelist.subreddits = sanitizeStringArray(importedConfig.whitelist.subreddits);
+                         newConfig.whitelist.users = sanitizeStringArray(importedConfig.whitelist.users);
+                     }
+                      if (importedConfig.blacklist) {
+                         newConfig.blacklist.subreddits = sanitizeStringArray(importedConfig.blacklist.subreddits);
+                         newConfig.blacklist.users = sanitizeStringArray(importedConfig.blacklist.users);
+                     }
+
+                     // UI State
+                     if (typeof importedConfig.uiPosition === 'object' && importedConfig.uiPosition !== null) {
+                         newConfig.uiPosition = { ...DEFAULT_CONFIG.uiPosition, ...importedConfig.uiPosition };
+                         // Basic validation for position values if needed
+                     }
+                      if (typeof importedConfig.uiVisible === 'boolean') {
+                         newConfig.uiVisible = importedConfig.uiVisible;
+                     }
+                     if (typeof importedConfig.activeTab === 'string') {
+                         // Ensure the tab exists in the current UI
+                         const validTabs = ['settings', 'groups', 'stats'];
+                         if (validTabs.includes(importedConfig.activeTab)) {
+                            newConfig.activeTab = importedConfig.activeTab;
+                         }
+                     }
+
+                     // --- Apply the validated config ---
+                     this.config = newConfig;
+
+                     // Apply UI position/visibility immediately if container exists
+                     if (this.uiContainer) {
+                         const p = this.config.uiPosition;
+                         this.uiContainer.style.top = p.top || DEFAULT_CONFIG.uiPosition.top;
+                         if (p.left !== null && p.left !== undefined) { this.uiContainer.style.left = p.left; this.uiContainer.style.right = 'auto'; }
+                         else { this.uiContainer.style.left = 'auto'; this.uiContainer.style.right = p.right || DEFAULT_CONFIG.uiPosition.right; }
+                         if (p.width && p.width !== 'auto') this.uiContainer.style.width = p.width;
+                         if (p.height && p.height !== 'auto') this.uiContainer.style.height = p.height;
+                         this.uiContainer.style.display = this.config.uiVisible ? 'block' : 'none';
+                     }
+
+                     this.log(`Configuration imported successfully. ${newConfig.rules.length} global rules, ${newConfig.filterGroups.length} groups loaded.`);
+                     await this.saveConfig(); // Save the validated config
+                     this.updateUI(); // Refresh the UI display
+
+                     // Clear caches and re-apply filters with the new config
+                     this.processedNodes = new WeakSet();
+                     this.originalContentCache = new WeakMap();
+                     this.applyFilters(document.body);
+
+                     alert('Configuration imported successfully!');
+
+                 } catch (err) {
+                     alert(`Import error: ${err.message}`);
+                     this.log(`Import error: ${err.message}`);
+                     console.error("Import Error:", err);
+                 } finally {
+                     if (fileInput) fileInput.value = null; // Reset file input
+                 }
+             };
+
+             reader.onerror = (e) => {
+                 alert(`File read error: ${e.target?.error || 'Unknown error'}`);
+                 this.log(`File read error: ${e.target?.error}`);
+                 if (fileInput) fileInput.value = null; // Reset file input
+             };
+
+             reader.readAsText(file);
+        }
+
+        isValidRule(rule) {
+            // (No changes from v2.2.0 needed here)
+            if (!rule || typeof rule !== 'object') return false;
+            const validTargets = ['title', 'body', 'both'];
+            return RULE_TYPES.includes(rule.type) &&
+                   typeof rule.text === 'string' && rule.text.trim() !== '' &&
+                   typeof rule.isRegex === 'boolean' &&
+                   typeof rule.caseSensitive === 'boolean' &&
+                   typeof rule.normalize === 'boolean' &&
+                   (typeof rule.target === 'string' && validTargets.includes(rule.target));
+        }
+
+        sanitizeRule(rule) {
+            // (No changes from v2.2.0 needed here)
+             let sanitizedRule = { ...rule }; // Copy rule
+             // Ensure user/subreddit rules are lowercase and not regex/normalized/case-sensitive
+             if (sanitizedRule.type === 'user' || sanitizedRule.type === 'subreddit') {
+                 sanitizedRule.text = sanitizedRule.text.toLowerCase().replace(/^(u\/|r\/)/i, '');
+                 sanitizedRule.caseSensitive = false;
+                 sanitizedRule.normalize = false;
+                 sanitizedRule.isRegex = false;
+             }
+             // Ensure normalized keyword rules are not case-sensitive
+             if (sanitizedRule.normalize && sanitizedRule.type === 'keyword' && !sanitizedRule.isRegex) {
+                 sanitizedRule.caseSensitive = false;
+             }
+             return sanitizedRule;
+        }
+
+        // --- Other Methods ---
+        addScrollListener() {
+            // (No changes from v2.1.1 needed here)
+             let scrollTimeout = null;
+             const handleScroll = () => {
+                 if (scrollTimeout !== null) {
+                     window.clearTimeout(scrollTimeout);
+                 }
+                 // Avoid excessive filtering if filters were just applied
+                 if (performance.now() - this.lastFilterTime < DEBOUNCE_DELAY_MS / 2) {
+                     return;
+                 }
+                 scrollTimeout = setTimeout(() => {
+                     // Use requestAnimationFrame for smoother rendering integration
+                     window.requestAnimationFrame(() => {
+                        this.debugLog("Scroll end detected, running filter check...");
+                        this.applyFilters(document.body); // Check the whole body for potentially revealed items
+                     });
+                     scrollTimeout = null;
+                 }, DEBOUNCE_DELAY_MS);
+             };
+             window.addEventListener('scroll', handleScroll, { passive: true });
+             this.log("Scroll listener added.");
+        }
+
+        registerMenuCommands() {
+            // (No changes from v2.1.1 needed here)
+             GM_registerMenuCommand('Toggle Filter Panel', () => this.toggleUIVisibility());
+             GM_registerMenuCommand('Re-apply All Filters', () => {
+                 this.log("Manual re-filter triggered via menu.");
+                 this.processedNodes = new WeakSet(); // Clear processed nodes
+                 this.originalContentCache = new WeakMap(); // Clear original text cache
+                 this.applyFilters(document.body); // Re-filter entire document
+             });
+             GM_registerMenuCommand('Reset Filter Statistics', () => this.resetStats());
+        }
+
+        toggleUIVisibility(forceState = null) {
+            // (No changes from v2.1.1 needed here, but ensures button updates)
+            const shouldBeVisible = forceState !== null ? forceState : !this.config.uiVisible;
+            if (shouldBeVisible !== this.config.uiVisible) {
+                this.config.uiVisible = shouldBeVisible;
+                if (this.uiContainer) {
+                    this.uiContainer.style.display = this.config.uiVisible ? 'block' : 'none';
+                }
+                this.saveConfig(); // Save visibility state
+
+                // Update UI content if becoming visible, or just hide
+                if (this.config.uiVisible) {
+                    this.updateUI(); // Refresh UI content when shown
+                }
+
+                // Update the floating button text/title
+                const optionsButton = document.getElementById(`${SCRIPT_PREFIX}-options-btn`);
+                if (optionsButton) {
+                    optionsButton.textContent = this.config.uiVisible ? 'Hide RACF' : 'Show RACF';
+                    optionsButton.title = this.config.uiVisible ? 'Hide Filter Panel' : 'Show Filter Panel';
+                }
+            }
+        }
+
+        async saveConfigAndApplyFilters() {
+            // (No changes from v2.1.1 needed here)
+            await this.saveConfig();
+
+            // Debounce the re-application of filters
+            if (this.filterApplyDebounceTimer) clearTimeout(this.filterApplyDebounceTimer);
+            this.filterApplyDebounceTimer = setTimeout(() => {
+                this.log("Configuration changed, clearing caches and re-applying filters...");
+                this.processedNodes = new WeakSet(); // Clear processed nodes on config change
+                this.originalContentCache = new WeakMap(); // Clear text cache as rules changed
+                this.applyFilters(document.body); // Re-filter the entire document
+                this.filterApplyDebounceTimer = null;
+            }, 150); // Short delay after config save before heavy re-filter
+        }
+
+    } // --- End RedditFilter Class ---
+
+    // --- Options Button (Floating Button) ---
+    function addOptionsButton() {
+        // (No changes from v2.2.0 needed here)
+         const buttonId = `${SCRIPT_PREFIX}-options-btn`;
+         if (document.getElementById(buttonId)) return; // Already exists
+
+         const btn = document.createElement('button');
+         btn.id = buttonId;
+         // Basic styling - adjust as needed
+         btn.style.cssText = `
+             position: fixed;
+             bottom: 15px;
+             right: 15px;
+             z-index: 10000; /* Ensure it's above most elements */
+             padding: 8px 16px;
+             background-color: #0079D3; /* Reddit blue */
+             color: white;
+             border: 1px solid #006abd;
+             border-radius: 20px; /* Pill shape */
+             cursor: pointer;
+             font-weight: bold;
+             font-size: 13px;
+             box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+             transition: background-color 0.2s ease, box-shadow 0.2s ease, transform 0.1s ease;
+             font-family: inherit; /* Use Reddit's font if possible */
+             line-height: 1.5;
+         `;
+
+         // Hover/Active Effects
+         btn.onmouseover = () => { btn.style.backgroundColor = '#005fa3'; btn.style.boxShadow = '0 6px 12px rgba(0, 0, 0, 0.3)'; };
+         btn.onmouseout = () => { btn.style.backgroundColor = '#0079D3'; btn.style.boxShadow = '0 4px 8px rgba(0, 0, 0, 0.2)'; btn.style.transform = 'scale(1)';};
+         btn.onmousedown = () => { btn.style.transform = 'scale(0.97)'; };
+         btn.onmouseup = () => { btn.style.transform = 'scale(1)'; };
+
+         // Set initial text based on instance state (if available)
+         const instance = window.redditAdvancedFilterInstance_2_0; // Use consistent instance name
+         btn.textContent = (instance && instance.config.uiVisible) ? 'Hide RACF' : 'Show RACF';
+         btn.title = (instance && instance.config.uiVisible) ? 'Hide Filter Panel' : 'Show Filter Panel';
+
+         // Click handler
+         btn.addEventListener('click', () => {
+             const currentInstance = window.redditAdvancedFilterInstance_2_0;
+             if (currentInstance) {
+                 currentInstance.toggleUIVisibility();
+             } else {
+                 console.warn(`[${SCRIPT_PREFIX}] Filter instance not found on button click.`);
+             }
+         });
+
+         document.body.appendChild(btn);
+         GM_log(`[${SCRIPT_PREFIX}] Options button added.`);
+    }
+
+    // --- Script Initialization ---
+    function runScript() {
+        // (No changes from v2.2.0 needed here)
+        const instanceName = 'redditAdvancedFilterInstance_2_0'; // Use consistent versioned name
+
+        if (window[instanceName]) {
+            const version = window[instanceName].constructor?.version || GM_info?.script?.version || '?';
+            GM_log(`[${SCRIPT_PREFIX}] Instance ${instanceName} already running (v${version}). Skipping initialization.`);
+             // Ensure options button exists and reflects current state
+            if (!document.getElementById(`${SCRIPT_PREFIX}-options-btn`)) {
+                 addOptionsButton();
+            } else {
+                 // Update button text if it exists but instance was recreated somehow
+                 const btn = document.getElementById(`${SCRIPT_PREFIX}-options-btn`);
+                 if (btn) {
+                    const inst = window[instanceName];
+                    if (inst) {
+                        btn.textContent = inst.config.uiVisible ? 'Hide RACF' : 'Show RACF';
+                        btn.title = inst.config.uiVisible ? 'Hide Filter Panel' : 'Show Filter Panel';
+                    }
+                 }
+            }
+            return;
+        }
+
+        // Create and initialize the new instance
+        window[instanceName] = new RedditFilter();
+        window[instanceName].init()
+            .then(() => {
+                 addOptionsButton(); // Add button after successful init
+                 GM_log(`[${SCRIPT_PREFIX}] Initialization successful. Instance: ${instanceName}`);
+             })
+            .catch(error => {
+                GM_log(`[${SCRIPT_PREFIX}] Initialization failed: ${error.message}`);
+                console.error(`[${SCRIPT_PREFIX}] Full initialization error:`, error);
+                delete window[instanceName]; // Clean up failed instance
+            });
+    }
+
+    // --- Run Script ---
+    // Wait for the DOM to be ready before initializing
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', runScript);
+    } else {
+        runScript(); // DOM is already ready
+    }
+
+})();
